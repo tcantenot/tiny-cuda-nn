@@ -37,6 +37,8 @@ set(SOURCES
 	reduce_sum.cu
 )
 
+file(GLOB_RECURSE HEADERS ../include/*.h)
+
 if (MIN_GPU_ARCH GREATER_EQUAL 70)
 	list(APPEND SOURCES fully_fused_mlp.cu)
 endif()
@@ -45,6 +47,6 @@ endif()
 # Linker / library
 ###############################################################################
 
-add_library(tiny-cuda-nn STATIC ${SOURCES})
+add_library(tiny-cuda-nn STATIC ${SOURCES} ${HEADERS})
 target_link_libraries(tiny-cuda-nn PUBLIC ${CUDA_LIBRARIES} cuda cublas)
 target_compile_options(tiny-cuda-nn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
