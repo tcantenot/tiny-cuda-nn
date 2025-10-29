@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   average.h
@@ -40,7 +39,7 @@
 #include <string>
 #include <vector>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template <typename T>
 __global__ void average_step(
@@ -66,13 +65,11 @@ public:
 		update_hyperparams(params);
 	}
 
-	void allocate(std::shared_ptr<ParametricObject<T>> target) override {
-		m_target = target;
-		m_nested->allocate(target);
+	void allocate(uint32_t n_weights, const std::vector<std::pair<uint32_t, uint32_t>>& layer_sizes) override {
+		m_n_weights = n_weights;
+		m_layer_sizes = layer_sizes;
 
-		uint32_t size = (uint32_t)target->n_params();
-
-		m_n_weights = size;
+		m_nested->allocate(n_weights, layer_sizes);
 
 		m_weights_samples.resize(m_n_weights * m_n_samples);
 		m_weights_samples.memset(0);
@@ -121,11 +118,20 @@ public:
 		return m_weights_samples.data() + current_sample_idx() * m_n_weights;
 	}
 
+	size_t n_nested() const override {
+		return 1;
+	}
+
+	const std::shared_ptr<Optimizer<T>>& nested(size_t idx) const override {
+		CHECK_THROW(idx == 0);
+		return m_nested;
+	}
+
 	void update_hyperparams(const json& params) override {
 		if (params.contains("n_samples")) {
 			m_n_samples = params["n_samples"];
-			if (m_target) {
-				allocate(m_target);
+			if (m_n_weights > 0 || !m_layer_sizes.empty()) {
+				allocate(m_n_weights, m_layer_sizes);
 			}
 		}
 
@@ -159,12 +165,12 @@ public:
 private:
 	uint32_t m_n_samples = 128;
 	uint32_t m_n_weights = 0;
-	std::unique_ptr<Optimizer<T>> m_nested;
+	std::shared_ptr<Optimizer<T>> m_nested;
 
-	std::shared_ptr<ParametricObject<T>> m_target;
+	std::vector<std::pair<uint32_t, uint32_t>> m_layer_sizes;
 
 	GPUMemory<T> m_weights_samples;
 	GPUMemory<T> m_weights_average;
 };
 
-TCNN_NAMESPACE_END
+}

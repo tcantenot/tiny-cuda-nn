@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   gpu_memory_json.h
@@ -32,7 +31,7 @@
 
 #include <json/json.hpp>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 inline nlohmann::json::binary_t gpu_memory_to_json_binary(const void* gpu_data, size_t n_bytes) {
 	nlohmann::json::binary_t data_cpu;
@@ -52,29 +51,23 @@ inline void to_json(nlohmann::json& j, const GPUMemory<T>& gpu_data) {
 
 template <typename T>
 inline void from_json(const nlohmann::json& j, GPUMemory<T>& gpu_data) {
-
-	if(j.is_binary()) {
-		const nlohmann::json::binary_t& cpu_data = j;
+	if (j.is_binary()) {
+		const nlohmann::json::binary_t& cpu_data = j.get_binary();
 		gpu_data.resize(cpu_data.size()/sizeof(T));
 		json_binary_to_gpu_memory(cpu_data, gpu_data.data(), gpu_data.get_bytes());
-	}
-	else if(j.is_object()) {
+	} else if (j.is_object()) {
 		// https://json.nlohmann.me/features/binary_values/#json
 		json::array_t arr = j["bytes"];
-
-		std::vector<uint8_t> cpu_data;
+		nlohmann::json::binary_t cpu_data;
 		cpu_data.resize(arr.size());
-		for(size_t i = 0; i < arr.size(); ++i)
-		{
-			cpu_data[i] = arr[i]; // Each member of 'arr' is a json object...
+		for(size_t i = 0; i < arr.size(); ++i) {
+			cpu_data[i] = (uint8_t)arr[i];
 		}
-
 		gpu_data.resize(cpu_data.size()/sizeof(T));
 		json_binary_to_gpu_memory(cpu_data, gpu_data.data(), gpu_data.get_bytes());
-	}
-	else {
+	} else {
 		throw std::runtime_error("Invalid json type: must be either binary or object");
 	}
 }
 
-TCNN_NAMESPACE_END
+}

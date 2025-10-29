@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   mlp-learning-an-image.cu
@@ -188,7 +187,7 @@ int main(int argc, char* argv[]) {
 		// int sampling_height = 1024;
 
 		uint32_t n_coords = sampling_width * sampling_height;
-		uint32_t n_coords_padded = next_multiple(n_coords, batch_size_granularity);
+		uint32_t n_coords_padded = next_multiple(n_coords, BATCH_SIZE_GRANULARITY);
 
 		GPUMemory<float> sampled_image(n_coords * 3);
 		GPUMemory<float> xs_and_ys(n_coords_padded * 2);
@@ -211,7 +210,7 @@ int main(int argc, char* argv[]) {
 		// Fourth step: train the model by sampling the above image and optimizing an error metric
 
 		// Various constants for the network and optimization
-		const uint32_t batch_size = 1 << 16;
+		const uint32_t batch_size = 1 << 18;
 		const uint32_t n_training_steps = argc >= 4 ? atoi(argv[3]) : 10000000;
 		const uint32_t n_input_dims = 2; // 2-D image coordinate
 		const uint32_t n_output_dims = 3; // RGB color
@@ -238,6 +237,13 @@ int main(int argc, char* argv[]) {
 		std::shared_ptr<Loss<precision_t>> loss{create_loss<precision_t>(loss_opts)};
 		std::shared_ptr<Optimizer<precision_t>> optimizer{create_optimizer<precision_t>(optimizer_opts)};
 		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(n_input_dims, n_output_dims, encoding_opts, network_opts);
+		network->set_jit_fusion(tcnn::supports_jit_fusion());
+
+		if (network->jit_fusion()) {
+			std::cout << "JIT fusion is enabled." << std::endl;
+		} else {
+			std::cout << "JIT fusion is unavailable. Must use CUDA 11.8 and a GPU with compute capability 75 or higher." << std::endl;
+		}
 
 		auto trainer = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
 
@@ -282,7 +288,7 @@ int main(int argc, char* argv[]) {
 
 				if (visualize_learned_func) {
 					network->inference(inference_stream, inference_batch, prediction);
-					auto filename = std::to_string(i) + ".jpg";
+					auto filename = fmt::format("{}.jpg", i);
 					std::cout << "Writing '" << filename << "'... ";
 					save_image(prediction.data(), sampling_width, sampling_height, 3, n_output_dims, filename);
 					std::cout << "done." << std::endl;
@@ -310,7 +316,7 @@ int main(int argc, char* argv[]) {
 
 		// If only the memory arenas pertaining to a single stream are to be freed, use
 		//free_gpu_memory_arena(stream);
-	} catch (std::exception& e) {
+	} catch (const std::exception& e) {
 		std::cout << "Uncaught exception: " << e.what() << std::endl;
 	}
 

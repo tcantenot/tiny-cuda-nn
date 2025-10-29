@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   novograd.h
@@ -35,13 +34,12 @@
 #include <tiny-cuda-nn/optimizer.h>
 #include <tiny-cuda-nn/reduce_sum.h>
 
-#include <iostream>
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
 #include <vector>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template <typename T>
 __global__ void novo_step(
@@ -98,21 +96,20 @@ public:
 		update_hyperparams(params);
 	}
 
-	void allocate(std::shared_ptr<ParametricObject<T>> target) override {
-		uint32_t size = (uint32_t)target->n_params();
+	void allocate(uint32_t n_weights, const std::vector<std::pair<uint32_t, uint32_t>>& layer_sizes) override {
+		m_n_weights = n_weights;
 
-		m_n_weights = size;
 		if (m_n_weights <= m_first_moments.size()) {
 			return;
 		}
 
-		m_first_moments.resize(size);
+		m_first_moments.resize(m_n_weights);
 		m_first_moments.memset(0);
 
 		size_t total_size = 0;
 
 		m_layers.clear();
-		for (const auto& pair : target->layer_sizes()) {
+		for (const auto& pair : layer_sizes) {
 			m_layers.push_back(pair.first * pair.second);
 			total_size += m_layers.back();
 		}
@@ -130,9 +127,9 @@ public:
 
 			if (workspace_size > m_reduction_workspace.size()) {
 				workspace_size *= 2;
-#ifdef TCNN_VERBOSE_MEMORY_ALLOCS
-				std::cout << "NOVOGRAD: resizing reduction buffer to " << workspace_size << std::endl;
-#endif
+
+				log_debug("Novograd: resizing reduction buffer to {}", bytes_to_string(workspace_size));
+
 				m_reduction_workspace.resize(workspace_size);
 			}
 
@@ -263,4 +260,4 @@ private:
 	float m_absolute_weight_decay = 0.0f;
 };
 
-TCNN_NAMESPACE_END
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   relative_l2_luminance.h
@@ -35,7 +34,7 @@
 #include <tiny-cuda-nn/common_device.h>
 #include <tiny-cuda-nn/loss.h>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template <typename T>
 __global__ void relative_l2_luminance_loss(
@@ -92,25 +91,20 @@ class RelativeL2LuminanceLoss : public Loss<T> {
 public:
 	void evaluate(
 		cudaStream_t stream,
-		const uint32_t stride,
-		const uint32_t dims,
 		const float loss_scale,
 		const GPUMatrix<T>& prediction,
 		const GPUMatrix<float>& target,
 		GPUMatrix<float>& values,
 		GPUMatrix<T>& gradients,
-		const GPUMatrix<float>* data_pdf = nullptr) const override {
-		if (prediction.n() != target.n()) {
-			throw std::runtime_error(std::string("Prediction and target don't have matching batch size ") + std::to_string(prediction.n()) + "!=" + std::to_string(target.n()));
-		}
+		const GPUMatrix<float>* data_pdf = nullptr
+	) const override {
+		const uint32_t dims = target.m();
+		const uint32_t stride = prediction.m();
 
-		if (prediction.m() != stride) {
-			throw std::runtime_error(std::string("Prediction does not have appropriate dimensions ") + std::to_string(prediction.m()) + "!=" + std::to_string(stride));
-		}
-
-		if (target.m() != dims) {
-			throw std::runtime_error(std::string("Target does not have appropriate dimensions ") + std::to_string(target.m()) + "!=" + std::to_string(dims));
-		}
+		CHECK_THROW(prediction.n() == target.n());
+		CHECK_THROW(values.m() == stride);
+		CHECK_THROW(gradients.m() == stride);
+		CHECK_THROW(!data_pdf || data_pdf->m() == dims);
 
 		linear_kernel(relative_l2_luminance_loss<T>, 0, stream,
 			prediction.n_elements(),
@@ -132,6 +126,28 @@ public:
 			{"otype", "RelativeL2Luminance"},
 		};
 	}
+
+	std::string generate_device_function(const std::string& name, uint32_t n_dims) const override {
+		return this->generate_device_function_from_body(name, n_dims, dfmt(1, R"(
+				vec<{N_DIMS}> prediction_fp = prediction;
+
+				vec3 rgb = prediction_fp.slice<0, 3>();
+				{DOUBLE_RGB}
+
+				float luminance = dot(rgb, vec3(0.299f, 0.587f, 0.114f));
+
+				auto diff = prediction_fp - target;
+				auto scale = (1.0f / (float)n_elements) / (luminance * luminance + 1e-2f) / pdf;
+				if (value) {{
+					*value = diff * diff * scale;
+				}}
+
+				return (2.0f * loss_scale) * diff * scale;
+			)",
+			"N_DIMS"_a = n_dims,
+			"DOUBLE_RGB"_a = n_dims >= 6 ? "rgb += prediction_fp.slice<3, 3>();" : ""
+		));
+	}
 };
 
-TCNN_NAMESPACE_END
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   gpu_matrix.h
@@ -32,7 +31,6 @@
 
 #include <tiny-cuda-nn/common.h>
 #include <tiny-cuda-nn/gpu_memory.h>
-#include <tiny-cuda-nn/matrix_layout.h>
 
 #include <pcg32/pcg32.h>
 
@@ -41,7 +39,7 @@
 #include <string>
 #include <vector>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template<typename T>
 class GPUMatrixDynamic;
@@ -63,9 +61,7 @@ public:
 		}
 
 		if (memory.bytes() < total_n_bytes) {
-#ifdef TCNN_VERBOSE_MEMORY_ALLOCS
-			std::cout << "GPUMatrix: Allocating " << bytes_to_string(total_n_bytes) << " shared among " << matrices.size() << " matrices." << std::endl;
-#endif
+			log_debug("GPUMatrix: allocating {} shared among {} matrices.", bytes_to_string(total_n_bytes), matrices.size());
 			memory.resize(total_n_bytes);
 		}
 
@@ -107,39 +103,11 @@ public:
 };
 
 template <typename T>
-struct MatrixView {
-	TCNN_HOST_DEVICE MatrixView() : data{nullptr}, stride_i{0}, stride_j{0} {}
-	TCNN_HOST_DEVICE MatrixView(T* data, uint32_t stride_i, uint32_t stride_j) : data{data}, stride_i{stride_i}, stride_j{stride_j} {}
-	TCNN_HOST_DEVICE MatrixView(const MatrixView<std::remove_const_t<T>>& other) : data{other.data}, stride_i{other.stride_i}, stride_j{other.stride_j} {}
-
-	TCNN_HOST_DEVICE T& operator()(uint32_t i, uint32_t j = 0) const {
-		return data[i * stride_i + j * stride_j];
-	}
-
-	TCNN_HOST_DEVICE void advance(uint32_t m, uint32_t n) {
-		data = &(*this)(m, n);
-	}
-
-	TCNN_HOST_DEVICE void advance_rows(uint32_t m) {
-		advance(m, 0);
-	}
-
-	TCNN_HOST_DEVICE void advance_cols(uint32_t n) {
-		advance(0, n);
-	}
-
-	TCNN_HOST_DEVICE explicit operator bool() const {
-		return data;
-	}
-
-	T* data;
-	uint32_t stride_i, stride_j;
-};
-
-template <typename T>
 class GPUMatrixDynamic : public GPUMatrixBase {
 public:
 	using Type = T;
+	using View = MatrixView<T>;
+	using ConstView = MatrixView<const T>;
 
 	// Owning its memory as a GPUMemory<T>
 	GPUMatrixDynamic(uint32_t m, uint32_t n, MatrixLayout layout = CM)
@@ -181,6 +149,7 @@ public:
 	}
 
 	GPUMatrixDynamic(const GPUMatrixDynamic<T>& other) = delete;
+	GPUMatrixDynamic<T>& operator=(const GPUMatrixDynamic<T>& other) = delete;
 
 	virtual ~GPUMatrixDynamic() {}
 
@@ -204,11 +173,13 @@ public:
 	void resize(uint32_t rows, uint32_t cols) {
 		if (m_arena_allocation) {
 			cudaStream_t stream = m_arena_allocation->stream();
-			m_arena_allocation.reset();
+			m_arena_allocation.reset(); // reset is called explicitly to ensure memory is freed before being allocated
 			m_arena_allocation = std::make_shared<GPUMemoryArena::Allocation>(allocate_workspace(stream, rows * cols * sizeof(T)));
-		} else if (m_malloc_allocation) {
-			m_malloc_allocation.reset();
+			m_data = (T*)m_arena_allocation->data();
+		} else if (m_malloc_allocation || !data()) {
+			m_malloc_allocation.reset(); // reset is called explicitly to ensure memory is freed before being allocated
 			m_malloc_allocation = std::make_shared<GPUMemory<uint8_t>>(rows * cols * sizeof(T));
+			m_data = (T*)m_malloc_allocation->data();
 		} else {
 			throw std::runtime_error{"GPUMatrix::resize is not permitted when the underlying memory is not owned. Use GPUMatrix::set instead."};
 		}
@@ -252,8 +223,12 @@ public:
 		return slice(0, rows(), 0, cols());
 	}
 
-	MatrixView<T> view() const {
+	View view() const {
 		return {data(), layout() == CM ? 1u : stride(), layout() == CM ? stride() : 1u};
+	}
+
+	ConstView const_view() const {
+		return view();
 	}
 
 	uint32_t rows() const { return m_rows; }
@@ -288,7 +263,32 @@ public:
 		CUDA_CHECK_THROW(cudaMemsetAsync(data(), value, n_bytes(), stream));
 	}
 
+	std::vector<T> to_cpu_vector() {
+		CHECK_THROW(data());
+		CHECK_THROW(is_contiguous());
+		std::vector<T> v(n_elements());
+		CUDA_CHECK_THROW(cudaMemcpy(v.data(), data(), n_bytes(), cudaMemcpyDeviceToHost));
+		return v;
+	}
+
 	// Various initializations
+	void initialize_uniform(pcg32& rnd, float low, float high) {
+		CHECK_THROW(data());
+		CHECK_THROW(is_contiguous());
+
+		// Define probability distribution
+		float scale = high - low;
+
+		// Sample initialized values
+		std::vector<T> new_data(n_elements());
+
+		for (size_t i = 0; i < new_data.size(); ++i) {
+			new_data[i] = (T)(low + rnd.next_float() * scale);
+		}
+
+		CUDA_CHECK_THROW(cudaMemcpy(data(), new_data.data(), n_bytes(), cudaMemcpyHostToDevice));
+	}
+
 	void initialize_xavier_uniform(pcg32& rnd, float scale = 1) {
 		CHECK_THROW(data());
 		CHECK_THROW(is_contiguous());
@@ -464,6 +464,7 @@ public:
 	}
 
 	GPUMatrix(const GPUMatrixDynamic<T>& other) = delete;
+	GPUMatrix<T>& operator=(const GPUMatrixDynamic<T>& other) = delete;
 
 	virtual ~GPUMatrix() {}
 
@@ -524,4 +525,4 @@ GPUMemoryArena::Allocation GPUMatrixBase::allocate_shared_memory(cudaStream_t st
 	return allocate_shared_memory(stream, matrix_pointers);
 }
 
-TCNN_NAMESPACE_END
+}

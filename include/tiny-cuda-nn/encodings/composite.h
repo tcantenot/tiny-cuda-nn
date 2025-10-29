@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   composite.h
@@ -32,9 +31,9 @@
 #pragma once
 
 #include <tiny-cuda-nn/common.h>
+#include <tiny-cuda-nn/common_device.h>
 #include <tiny-cuda-nn/encoding.h>
 #include <tiny-cuda-nn/gpu_memory.h>
-#include <tiny-cuda-nn/common_device.h>
 #include <tiny-cuda-nn/multi_stream.h>
 
 #include <numeric>
@@ -43,16 +42,105 @@
 #include <string>
 #include <vector>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
+
+template <typename T>
+__global__ void reduce_sum_forward(
+	const uint32_t num_elements,
+	const uint32_t width,
+	const uint32_t num_to_reduce,
+	MatrixView<const T> to_reduce,
+	MatrixView<T> reduced
+) {
+	const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= num_elements) return;
+
+	for (uint32_t j = 0; j < width; ++j) {
+		float result = 0.0f;
+		for (uint32_t k = 0; k < num_to_reduce; ++k) {
+			result += (float)to_reduce(j + width * k, i);
+		}
+		reduced(j, i) = result;
+	}
+}
+
+template <typename T>
+__global__ void reduce_sum_backward(
+	const uint32_t num_elements,
+	const uint32_t width,
+	const uint32_t num_to_reduce,
+	MatrixView<T> dL_dinput,
+	MatrixView<const T> dL_doutput
+) {
+	const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= num_elements) return;
+
+	for (uint32_t j = 0; j < width; ++j) {
+		T tmp = dL_doutput(j, i);
+		for (uint32_t k = 0; k < num_to_reduce; ++k) {
+			dL_dinput(j + width * k, i) = tmp;
+		}
+	}
+}
+
+template <typename T>
+__global__ void reduce_product_forward(
+	const uint32_t num_elements,
+	const uint32_t width,
+	const uint32_t num_to_reduce,
+	MatrixView<const T> to_reduce,
+	MatrixView<T> reduced
+) {
+	const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= num_elements) return;
+
+	for (uint32_t j = 0; j < width; ++j) {
+		float result = 1.0f;
+		for (uint32_t k = 0; k < num_to_reduce; ++k) {
+			result *= (float)to_reduce(j + width * k, i);
+		}
+		reduced(j, i) = result;
+	}
+}
+
+template <typename T>
+__global__ void reduce_product_backward(
+	const uint32_t num_elements,
+	const uint32_t width,
+	const uint32_t num_to_reduce,
+	MatrixView<const T> to_reduce,
+	MatrixView<T> dL_dinput,
+	MatrixView<const T> dL_doutput
+) {
+	const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= num_elements) return;
+
+	for (uint32_t j = 0; j < width; ++j) {
+		float tmp = (float)dL_doutput(j, i);
+
+		for (uint32_t k = 0; k < num_to_reduce; ++k) {
+			float result = tmp;
+
+			// Silly quadratic algorithm that works around potential numeric problems.
+			// TODO: make more efficient.
+			for (uint32_t l = 0; l < num_to_reduce-1; ++l) {
+				result *= (float)to_reduce(j + width * (l < k ? l : (l+1)), i);
+			}
+
+			dL_dinput(j + width * k, i) = result;
+		}
+	}
+}
 
 template <typename T>
 class CompositeEncoding : public Encoding<T> {
 public:
-	CompositeEncoding(const json& params, uint32_t n_dims_to_encode)
-	: m_n_dims_to_encode{n_dims_to_encode} {
+	CompositeEncoding(const json& params, uint32_t n_dims_to_encode) : m_n_dims_to_encode{n_dims_to_encode} {
 		if (!params.contains("nested") || !params["nested"].is_array()) {
 			throw std::runtime_error{"Must provide an array of nested encodings to CompositeEncoding."};
 		}
+
+		m_reduction_type = string_to_reduction_type(params.value("reduction", "Concatenation"));
 
 		const json::array_t& nested = params["nested"];
 
@@ -66,7 +154,7 @@ public:
 		}
 
 		if (total_nested_dims_to_encode != 0xFFFFFFFF && total_nested_dims_to_encode > n_dims_to_encode) {
-			throw std::runtime_error{"CompositeEncoding: nested encodings must not encode more dims than composite"};
+			throw std::runtime_error{fmt::format("CompositeEncoding: nested encodings must not encode more dims {} than composite {}", total_nested_dims_to_encode, n_dims_to_encode)};
 		}
 
 		uint32_t unspecified_dims_to_encode = total_nested_dims_to_encode == 0xFFFFFFFF ? 0xFFFFFFFF : (n_dims_to_encode - total_nested_dims_to_encode);
@@ -98,19 +186,32 @@ public:
 		}
 
 		// Fix alignment such that min_alignment of each individual encoding's output is ensured
-		uint32_t dims_encoded_so_far = 0;
-		for (size_t i = 0; i < m_nested.size()-1; ++i) {
-			uint32_t desired_alignment = m_nested[i+1]->min_alignment();
-			uint32_t effective_alignmen_needed = next_multiple(dims_encoded_so_far, desired_alignment) - dims_encoded_so_far;
+		if (m_reduction_type == ReductionType::Concatenation) {
+			uint32_t dims_encoded_so_far = 0;
+			for (size_t i = 0; i < m_nested.size()-1; ++i) {
+				uint32_t desired_alignment = m_nested[i+1]->required_output_alignment();
+				uint32_t padded_output_width_required = next_multiple(dims_encoded_so_far + m_nested[i]->output_width(), desired_alignment) - dims_encoded_so_far;
 
-			if (effective_alignmen_needed > 0) {
-				m_nested[i]->set_alignment(effective_alignmen_needed);
+				m_nested[i]->set_padded_output_width(padded_output_width_required);
+
+				dims_encoded_so_far += m_nested[i]->padded_output_width();
+			}
+		} else {
+			uint32_t alignment = required_output_alignment();
+			for (const auto& nested : m_nested) {
+				nested->set_alignment(alignment);
 			}
 
-			dims_encoded_so_far += m_nested[i]->padded_output_width();
+			if (!m_nested.empty()) {
+				uint32_t output_width = m_nested.front()->output_width();
+				for (const auto& nested : m_nested) {
+					CHECK_THROW(nested->output_width() == output_width);
+				}
+			}
 		}
 	}
 
+#if !defined(TCNN_NO_FWD_BWD)
 	std::unique_ptr<Context> forward_impl(
 		cudaStream_t stream,
 		const GPUMatrixDynamic<float>& input,
@@ -125,7 +226,11 @@ public:
 		auto forward = std::make_unique<ForwardContext>();
 		forward->nested.resize(m_nested.size());
 
-		SyncedMultiStream synced_streams{stream, m_nested.size()};
+		GPUMatrixDynamic<T>* reduced_output = output;
+		if (m_reduction_type != ReductionType::Concatenation) {
+			forward->to_reduce = GPUMatrixDynamic<T>{padded_output_width() * (uint32_t)m_nested.size(), input.n(), stream, preferred_output_layout()};
+			output = &forward->to_reduce;
+		}
 
 		uint32_t output_offset = 0;
 
@@ -141,7 +246,7 @@ public:
 			}
 
 			forward->nested[i] = nested->forward(
-				stream,
+				stream, // TODO: use SyncedMultiStream but ensure memory arena allocations happen on `stream`
 				input.slice_rows(input_offset, input_width),
 				output ? &sliced_output : nullptr,
 				use_inference_params,
@@ -150,6 +255,26 @@ public:
 
 			input_offset += input_width;
 			output_offset += output_width;
+		}
+
+		if (reduced_output && m_reduction_type != ReductionType::Concatenation) {
+			switch (m_reduction_type) {
+				case ReductionType::Sum: linear_kernel(reduce_sum_forward<T>, 0, stream,
+					input.n(),
+					padded_output_width(),
+					(uint32_t)m_nested.size(),
+					forward->to_reduce.view(),
+					reduced_output->view()
+				); break;
+				case ReductionType::Product: linear_kernel(reduce_product_forward<T>, 0, stream,
+					input.n(),
+					padded_output_width(),
+					(uint32_t)m_nested.size(),
+					forward->to_reduce.view(),
+					reduced_output->view()
+				); break;
+				default: throw std::runtime_error{"CompositeEncoding::forward: invalid reduction type."};
+			}
 		}
 
 		return forward;
@@ -163,7 +288,7 @@ public:
 		const GPUMatrixDynamic<T>& dL_doutput,
 		GPUMatrixDynamic<float>* dL_dinput = nullptr,
 		bool use_inference_params = false,
-		EGradientMode param_gradients_mode = EGradientMode::Overwrite
+		GradientMode param_gradients_mode = GradientMode::Overwrite
 	) override {
 		if (m_n_dims_to_encode == 0) {
 			return;
@@ -172,6 +297,31 @@ public:
 		const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
 		if (forward.nested.size() != m_nested.size()) {
 			throw std::runtime_error{"CompositeEncoding::backward called with incompatible context size."};
+		}
+
+		const GPUMatrixDynamic<T>* dL_dunreduced_output = &dL_doutput;
+		GPUMatrixDynamic<T> dL_dnested_output;
+		if (m_reduction_type != ReductionType::Concatenation) {
+			dL_dnested_output = GPUMatrixDynamic<T>{forward.to_reduce.m(), forward.to_reduce.n(), stream, forward.to_reduce.layout()};
+			dL_dunreduced_output = &dL_dnested_output;
+			switch (m_reduction_type) {
+				case ReductionType::Sum: linear_kernel(reduce_sum_backward<T>, 0, stream,
+					input.n(),
+					padded_output_width(),
+					(uint32_t)m_nested.size(),
+					dL_dunreduced_output->view(),
+					dL_doutput.view()
+				); break;
+				case ReductionType::Product: linear_kernel(reduce_product_backward<T>, 0, stream,
+					input.n(),
+					padded_output_width(),
+					(uint32_t)m_nested.size(),
+					forward.to_reduce.view(),
+					dL_dunreduced_output->view(),
+					dL_doutput.view()
+				); break;
+				default: throw std::runtime_error{"CompositeEncoding::backward: invalid reduction type."};
+			}
 		}
 
 		SyncedMultiStream synced_streams{stream, m_nested.size()};
@@ -194,7 +344,7 @@ public:
 				*forward.nested[i],
 				input.slice_rows(input_offset, input_width),
 				output.slice_rows(output_offset, output_width),
-				dL_doutput.slice_rows(output_offset, output_width),
+				dL_dunreduced_output->slice_rows(output_offset, output_width),
 				dL_dinput ? &sliced_dL_dinput : nullptr,
 				use_inference_params,
 				param_gradients_mode
@@ -203,12 +353,17 @@ public:
 			output_offset += output_width;
 		}
 	}
+#endif // !defined(TCNN_NO_FWD_BWD)
 
 	uint32_t input_width() const override {
 		return m_n_dims_to_encode;
 	}
 
 	uint32_t padded_output_width() const override {
+		if (m_reduction_type != ReductionType::Concatenation) {
+			return m_nested.empty() ? 0 : m_nested.front()->padded_output_width();
+		}
+
 		uint32_t total = 0;
 		for (const auto& nested : m_nested) {
 			total += nested->padded_output_width();
@@ -217,67 +372,59 @@ public:
 	}
 
 	uint32_t output_width() const override {
-		uint32_t total = 0;
-		for (const auto& nested : m_nested) {
-			total += nested->output_width();
-		}
-		return total;
+		return padded_output_width();
 	}
 
 	uint32_t required_input_alignment() const override {
 		return 1;
 	}
 
-	void set_alignment(uint32_t alignment) override {
-		uint32_t n_dims = padded_output_width();
-		uint32_t last_n_dims = m_nested.back()->padded_output_width();
-
-		uint32_t desired_n_dims = next_multiple(n_dims, alignment);
-		m_nested.back()->set_alignment(desired_n_dims - (n_dims - last_n_dims));
-	}
-
-	uint32_t min_alignment() const override {
-		return 1;
-	}
-
-	bool supports_output_layout(MatrixLayout layout) const {
-		// Only supports layout if all nested encodings do
-		bool result = true;
-		for (const auto& nested : m_nested) {
-			result &= nested->supports_output_layout(layout);
+	void set_padded_output_width(uint32_t padded_output_width) override {
+		if (m_reduction_type == ReductionType::Concatenation) {
+			uint32_t prev_n_dims = this->padded_output_width() - m_nested.back()->padded_output_width();
+			CHECK_THROW(padded_output_width >= prev_n_dims);
+			m_nested.back()->set_padded_output_width(padded_output_width - prev_n_dims);
+		} else {
+			for (const auto& nested : m_nested) {
+				nested->set_padded_output_width(padded_output_width);
+			}
 		}
+	}
 
-		return result;
+	uint32_t required_output_alignment() const override {
+		uint32_t alignment = 1;
+		for (const auto& nested : m_nested) {
+			alignment = lcm(alignment, nested->required_output_alignment());
+		}
+		return alignment;
 	}
 
 	MatrixLayout preferred_output_layout() const override {
-		// Majority vote (with a bias toward SoA, because that's usually faster.)
-		size_t n_aos = 0;
-		size_t n_soa = 0;
-		for (const auto& nested : m_nested) {
-			if (nested->preferred_output_layout() == AoS) {
-				++n_aos;
-			} else {
-				++n_soa;
-			}
-		}
-
-		return n_aos > n_soa ? AoS : SoA;
+		// Output layout of first nested encoding (tends to be the most significant, i.e. hash encoding)
+		return m_nested.empty() ? AoS : m_nested.front()->preferred_output_layout();
 	}
 
-	void initialize_params(pcg32& rnd, float* params_full_precision, T* params, T* inference_params, T* backward_params, T* gradients, float scale = 1) override {
+	size_t n_nested() const override {
+		return m_nested.size();
+	}
+
+	const std::shared_ptr<Encoding<T>>& nested(size_t idx = 0) const {
+		CHECK_THROW(idx < m_nested.size());
+		return m_nested[idx];
+	}
+
+	void set_params_impl(T* params, T* inference_params, T* gradients) override {
 		size_t offset = 0;
 		for (auto& nested : m_nested) {
-			nested->initialize_params(
-				rnd,
-				params_full_precision + offset,
-				params + offset,
-				inference_params + offset,
-				backward_params + offset,
-				gradients + offset,
-				scale
-			);
+			nested->set_params(params + offset, inference_params + offset, gradients + offset);
 			offset += nested->n_params();
+		}
+	}
+
+	void initialize_params(pcg32& rnd, float* params_full_precision, float scale = 1) override {
+		for (auto& nested : m_nested) {
+			nested->initialize_params(rnd, params_full_precision, scale);
+			params_full_precision += nested->n_params();
 		}
 	}
 
@@ -301,16 +448,148 @@ public:
 		};
 	}
 
+	std::string generate_nested_name(const std::string& name, size_t i) const {
+		return fmt::format("{}_{}_{}", name, i, to_snake_case(m_nested[i]->name()));
+	}
+
+	std::string generate_device_function(const std::string& name) const override {
+		std::ostringstream preamble;
+		for (size_t i = 0; i < m_nested.size(); ++i) {
+			preamble << m_nested[i]->generate_device_function(generate_nested_name(name, i)) << "\n\n";
+		}
+
+		std::ostringstream body;
+		body << fmt::format("	{} result;\n", this->generate_vec_out());
+
+		size_t output_offset = 0;
+		size_t params_offset = 0;
+		size_t fwd_ctx_offset = 0;
+
+		switch (m_reduction_type) {
+			case ReductionType::Concatenation:
+				for (size_t i = 0; i < m_nested.size(); ++i) {
+					body << fmt::format(
+						"	result.slice<{OUTPUT_OFFSET}, {OUTPUT_WIDTH}>() = {NESTED}(input.slice<{INPUT_OFFSET}, {INPUT_WIDTH}>(), params + {PARAMS_OFFSET}, fwd_ctx ? fwd_ctx + WARP_SIZE * {FWD_CTX_OFFSET} : nullptr);\n",
+						"OUTPUT_WIDTH"_a = m_nested[i]->output_width(),
+						"OUTPUT_OFFSET"_a = output_offset,
+						"NESTED"_a = generate_nested_name(name, i),
+						"INPUT_WIDTH"_a = m_nested[i]->input_width(),
+						"INPUT_OFFSET"_a = m_dims_to_encode_begin[i],
+						"PARAMS_OFFSET"_a = params_offset,
+						"FWD_CTX_OFFSET"_a = fwd_ctx_offset
+					);
+
+					output_offset += m_nested[i]->output_width();
+					params_offset += m_nested[i]->n_params();
+					fwd_ctx_offset += m_nested[i]->device_function_fwd_ctx_bytes();
+				}
+				break;
+			default:
+				for (size_t i = 0; i < m_nested.size(); ++i) {
+					body << fmt::format(
+						"	result {OP}= {NESTED}(input.slice<{INPUT_OFFSET}, {INPUT_WIDTH}>(), params + {PARAMS_OFFSET}, fwd_ctx ? fwd_ctx + WARP_SIZE * {FWD_CTX_OFFSET} : nullptr);\n",
+						"OP"_a = (m_reduction_type == ReductionType::Sum ? "+" : "*"),
+						"NESTED"_a = generate_nested_name(name, i),
+						"INPUT_WIDTH"_a = m_nested[i]->input_width(),
+						"INPUT_OFFSET"_a = m_dims_to_encode_begin[i],
+						"PARAMS_OFFSET"_a = params_offset,
+						"FWD_CTX_OFFSET"_a = fwd_ctx_offset
+					);
+
+					params_offset += m_nested[i]->n_params();
+					fwd_ctx_offset += m_nested[i]->device_function_fwd_ctx_bytes();
+				}
+				break;
+		}
+
+		body << "	return result;";
+
+		return fmt::format("{}{}", preamble.str(), this->generate_device_function_from_body(name, body.str()));
+	}
+
+	std::string generate_backward_device_function(const std::string& name, uint32_t n_threads) const override {
+		std::ostringstream preamble;
+		for (size_t i = 0; i < m_nested.size(); ++i) {
+			preamble << m_nested[i]->generate_backward_device_function(generate_nested_name(name, i), n_threads) << "\n\n";
+		}
+
+		std::ostringstream body;
+		body << "	if (!dL_dx && !dL_dparams) { return; }\n";
+
+		size_t output_offset = 0;
+		size_t params_offset = 0;
+		size_t fwd_ctx_offset = 0;
+
+		switch (m_reduction_type) {
+			case ReductionType::Concatenation:
+				for (size_t i = 0; i < m_nested.size(); ++i) {
+					body << fmt::format(
+						"	{NESTED}(dL_dy.slice<{OUTPUT_OFFSET}, {OUTPUT_WIDTH}>(), params + {PARAMS_OFFSET}, fwd_ctx + WARP_SIZE * {FWD_CTX_OFFSET}, dL_dparams ? dL_dparams + {PARAMS_OFFSET} : nullptr, dL_dx ? &dL_dx->slice<{INPUT_OFFSET}, {INPUT_WIDTH}>() : nullptr);\n",
+						"OUTPUT_WIDTH"_a = m_nested[i]->output_width(),
+						"OUTPUT_OFFSET"_a = output_offset,
+						"NESTED"_a = generate_nested_name(name, i),
+						"INPUT_WIDTH"_a = m_nested[i]->input_width(),
+						"INPUT_OFFSET"_a = m_dims_to_encode_begin[i],
+						"PARAMS_OFFSET"_a = params_offset,
+						"FWD_CTX_OFFSET"_a = fwd_ctx_offset
+					);
+
+					output_offset += m_nested[i]->output_width();
+					params_offset += m_nested[i]->n_params();
+					fwd_ctx_offset += m_nested[i]->device_function_fwd_ctx_bytes();
+				}
+				break;
+			default:
+				for (size_t i = 0; i < m_nested.size(); ++i) {
+					body << fmt::format(
+						"	result = result {OP} {NESTED}(input.slice<{INPUT_OFFSET}, {INPUT_WIDTH}>(), params + {PARAMS_OFFSET}, fwd_ctx +  WARP_SIZE * {FWD_CTX_OFFSET});\n",
+						"OP"_a = (m_reduction_type == ReductionType::Sum ? "+" : "*"),
+						"NESTED"_a = generate_nested_name(name, i),
+						"INPUT_WIDTH"_a = m_nested[i]->input_width(),
+						"INPUT_OFFSET"_a = m_dims_to_encode_begin[i],
+						"PARAMS_OFFSET"_a = params_offset,
+						"FWD_CTX_OFFSET"_a = fwd_ctx_offset
+					);
+
+					params_offset += m_nested[i]->n_params();
+					fwd_ctx_offset += m_nested[i]->device_function_fwd_ctx_bytes();
+				}
+				break;
+		}
+
+		return fmt::format("{}{}", preamble.str(), this->generate_backward_device_function_from_body(name, body.str()));
+	}
+
+	uint32_t device_function_fwd_ctx_bytes() const override {
+		uint32_t total = 0;
+		for (const auto& nested : m_nested) {
+			total += nested->device_function_fwd_ctx_bytes();
+		}
+		return total;
+	}
+
+	bool device_function_fwd_ctx_aligned_per_element() const override {
+		return false;
+	}
+
+	uint32_t backward_device_function_shmem_bytes(uint32_t n_threads, GradientMode param_gradients_mode) const override {
+		uint32_t result = 0;
+		for (const auto& nested : m_nested) {
+			result = std::max(result, nested->backward_device_function_shmem_bytes(n_threads, param_gradients_mode));
+		}
+		return result;
+	}
+
 private:
 	struct ForwardContext : public Context {
 		std::vector<std::unique_ptr<Context>> nested;
+		GPUMatrixDynamic<T> to_reduce;
 	};
 
-	std::vector<std::unique_ptr<Encoding<T>>> m_nested;
+	std::vector<std::shared_ptr<Encoding<T>>> m_nested;
 	std::vector<uint32_t> m_dims_to_encode_begin;
 	uint32_t m_n_dims_to_encode;
-
-	MatrixLayout m_output_layout = AoS;
+	ReductionType m_reduction_type = ReductionType::Concatenation;
 };
 
-TCNN_NAMESPACE_END
+}

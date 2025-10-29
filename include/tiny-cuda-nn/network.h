@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   network.h
@@ -30,19 +29,10 @@
 
 #pragma once
 
-#include <tiny-cuda-nn/common.h>
+#include <tiny-cuda-nn/common_device.h>
 #include <tiny-cuda-nn/object.h>
 
-TCNN_NAMESPACE_BEGIN
-
-enum class WeightUsage {
-	Inference,
-	Forward,
-	Backward,
-};
-
-Activation string_to_activation(const std::string& activation_name);
-std::string to_string(Activation activation);
+namespace tcnn {
 
 template <typename T>
 void extract_dimension_pos_neg(cudaStream_t stream, const uint32_t num_elements, const uint32_t dim, const uint32_t fan_in, const uint32_t fan_out, const T* encoded, MatrixLayout layout, float* output);
@@ -69,7 +59,112 @@ public:
 template <typename T>
 Network<T, T>* create_network(const json& network);
 
+template <typename T>
+std::unique_ptr<Network<T>> default_network(uint32_t n_input_dims, uint32_t n_output_dims, const std::string& name) {
+	return std::unique_ptr<Network<T>>{create_network<T>({{"otype", name}, {"n_input_dims", n_input_dims}, {"n_output_dims", n_output_dims}})};
+}
+
+std::vector<std::string> builtin_networks();
+
 std::string select_network(const json& network);
 uint32_t minimum_alignment(const json& network);
 
-TCNN_NAMESPACE_END
+template <typename T>
+std::unique_ptr<CudaRtcKernel> generate_mlp_convert_params_to_jit_layout_kernel(uint32_t input_width, uint32_t width, uint32_t padded_output_width, uint32_t n_hidden);
+
+template <typename T>
+std::unique_ptr<CudaRtcKernel> generate_mlp_convert_params_from_jit_layout_kernel(uint32_t input_width, uint32_t width, uint32_t padded_output_width, uint32_t n_hidden);
+
+template <typename T>
+std::string generate_mlp_device_code(uint32_t input_width, uint32_t width, uint32_t padded_output_width, uint32_t output_width, uint32_t n_hidden, Activation activation, Activation output_activation);
+
+template <typename T>
+std::string generate_backward_mlp_device_code(uint32_t n_threads, uint32_t input_width, uint32_t width, uint32_t padded_output_width, uint32_t output_width, uint32_t n_hidden, Activation activation, Activation output_activation);
+
+template <typename T>
+uint32_t mlp_device_code_fwd_ctx_bytes(uint32_t input_width, uint32_t width, uint32_t padded_output_width, uint32_t output_width, uint32_t n_hidden, Activation activation, Activation output_activation) {
+	return (input_width + width * n_hidden + (output_activation != Activation::None ? padded_output_width : 0)) * sizeof(T);
+}
+
+template <typename T>
+uint32_t backward_mlp_device_code_shmem_bytes(uint32_t n_threads, GradientMode param_gradients_mode, uint32_t input_width, uint32_t width, uint32_t padded_output_width) {
+	if (param_gradients_mode == GradientMode::Ignore) {
+		return 0;
+	}
+
+	uint32_t max_n_bytes = sizeof(T) * std::max(input_width * width, std::max(width * width, width * padded_output_width));
+	if (n_threads % 32 != 0 || n_threads == 0) {
+		throw std::runtime_error{"Backward MLP device code only supports positive multiples of 32 threads."};
+	}
+
+	if (n_threads == 32) {
+		return max_n_bytes;
+	}
+
+	return max_n_bytes * (n_threads / 64);
+}
+
+template <typename T>
+void activation_gpu(cudaStream_t stream, const uint32_t num_elements, const Activation act, const T* in, T* out) {
+	static constexpr uint32_t ACTIVATION_VECTOR_SIZE = 16u / sizeof(T);
+	if (num_elements % ACTIVATION_VECTOR_SIZE != 0) {
+		throw std::runtime_error{fmt::format("activation_gpu: number of elements must be a multiple of {}", ACTIVATION_VECTOR_SIZE)};
+	}
+
+	// Activation::None is a noop
+	if (act == Activation::None && in == out) {
+		return;
+	}
+
+	linear_kernel(kernel_activation<T, ACTIVATION_VECTOR_SIZE>, 0, stream, div_round_up(num_elements, ACTIVATION_VECTOR_SIZE), act, in, out);
+}
+
+template <typename T>
+void activation_gpu(cudaStream_t stream, Activation activation, const GPUMatrixDynamic<T>& input, GPUMatrixDynamic<T>& output) {
+	if (input.n() != output.n() || input.m() != output.m()) {
+		throw std::runtime_error{fmt::format("Input and output don't have matching size: {} != {}", input.n(), output.n())};
+	}
+
+	activation_gpu(stream, input.n_elements(), activation, input.data(), output.data());
+}
+
+template <typename T>
+void activation_backward_gpu(cudaStream_t stream, const uint32_t num_elements, const Activation act, const T* __restrict__ values, const T* gradients_out, T* gradients_in) {
+	static constexpr uint32_t ACTIVATION_VECTOR_SIZE = 16u / sizeof(T);
+	if (num_elements % ACTIVATION_VECTOR_SIZE != 0) {
+		throw std::runtime_error{fmt::format("activation_backward_gpu: number of elements must be a multiple of {}", ACTIVATION_VECTOR_SIZE)};
+	}
+
+	// Activation transfer is a noop for Activation::None
+	if (act == Activation::None && gradients_out == gradients_in) {
+		return;
+	}
+
+	linear_kernel(kernel_activation_backward<T, ACTIVATION_VECTOR_SIZE>, 0, stream, div_round_up(num_elements, ACTIVATION_VECTOR_SIZE), act, values, gradients_out, gradients_in);
+}
+
+template <typename T>
+void activation_backward_gpu(cudaStream_t stream, Activation activation, const GPUMatrixDynamic<T>& values, GPUMatrixDynamic<T>& gradients) {
+	if (values.n() != gradients.n() || values.m() != gradients.m()) {
+		throw std::runtime_error{fmt::format("Values and gradients don't have matching size: {} != {}", values.n(), gradients.n())};
+	}
+
+	activation_backward_gpu(stream, values.n_elements(), activation, values.data(), gradients.data(), gradients.data());
+}
+
+template <typename T>
+void activation_backward_output_gpu(cudaStream_t stream, const uint32_t num_elements, const Activation act, const T* __restrict__ output_values, const T* gradients_out, T* gradients_in) {
+	static constexpr uint32_t ACTIVATION_VECTOR_SIZE = 16u / sizeof(T);
+	if (num_elements % ACTIVATION_VECTOR_SIZE != 0) {
+		throw std::runtime_error{fmt::format("activation_backward_output_gpu: number of elements must be a multiple of {}", ACTIVATION_VECTOR_SIZE)};
+	}
+
+	// Activation transfer is a noop for Activation::None
+	if (act == Activation::None && gradients_out == gradients_in) {
+		return;
+	}
+
+	linear_kernel(kernel_activation_backward_output<T, ACTIVATION_VECTOR_SIZE>, 0, stream, div_round_up(num_elements, ACTIVATION_VECTOR_SIZE), act, output_values, gradients_out, gradients_in);
+}
+
+}

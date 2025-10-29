@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   matrix_layout.h
@@ -32,7 +31,7 @@
 
 #include <tiny-cuda-nn/common.h>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 enum class MatrixLayout {
 	RowMajor = 0,
@@ -46,4 +45,4 @@ static constexpr MatrixLayout SoA = MatrixLayout::SoA;
 static constexpr MatrixLayout CM = MatrixLayout::ColumnMajor;
 static constexpr MatrixLayout AoS = MatrixLayout::AoS;
 
-TCNN_NAMESPACE_END
+}

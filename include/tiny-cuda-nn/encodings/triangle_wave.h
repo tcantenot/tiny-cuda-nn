@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   triangle_wave.h
@@ -41,7 +40,7 @@
 #include <string>
 #include <vector>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template <typename T>
 __global__ void triangle_wave_encoding(
@@ -113,9 +112,10 @@ class TriangleWaveEncoding : public Encoding<T> {
 public:
 	TriangleWaveEncoding(uint32_t n_frequencies, uint32_t n_dims_to_encode)
 	: m_n_frequencies{n_frequencies}, m_n_dims_to_encode{n_dims_to_encode} {
-		m_n_padded_output_dims = m_n_output_dims = m_n_dims_to_encode * m_n_frequencies;
+		m_n_output_dims = m_n_dims_to_encode * m_n_frequencies;
 	}
 
+#if !defined(TCNN_NO_FWD_BWD)
 	std::unique_ptr<Context> forward_impl(
 		cudaStream_t stream,
 		const GPUMatrixDynamic<float>& input,
@@ -125,7 +125,7 @@ public:
 	) override {
 		auto forward = std::make_unique<ForwardContext>();
 
-		if (!output || m_n_padded_output_dims == 0) {
+		if (!output || padded_output_width() == 0) {
 			return forward;
 		}
 
@@ -154,9 +154,9 @@ public:
 		const GPUMatrixDynamic<T>& dL_doutput,
 		GPUMatrixDynamic<float>* dL_dinput = nullptr,
 		bool use_inference_params = false,
-		EGradientMode param_gradients_mode = EGradientMode::Overwrite
+		GradientMode param_gradients_mode = GradientMode::Overwrite
 	) override {
-		if (!dL_dinput || m_n_padded_output_dims == 0) {
+		if (!dL_dinput) {
 			return;
 		}
 
@@ -171,30 +171,30 @@ public:
 			dL_dinput->view()
 		);
 	}
+#endif // !defined(TCNN_NO_FWD_BWD)
 
 	uint32_t input_width() const override {
 		return m_n_dims_to_encode;
 	}
 
 	uint32_t padded_output_width() const override {
-		return m_n_padded_output_dims;
+		return m_n_output_dims + m_n_to_pad;
 	}
 
 	uint32_t output_width() const override {
-		return m_n_padded_output_dims;
+		return padded_output_width();
 	}
 
 	uint32_t required_input_alignment() const override {
 		return 1;
 	}
 
-	void set_alignment(uint32_t alignment) override {
-		alignment = lcm(alignment, min_alignment());
-		m_n_padded_output_dims = next_multiple(m_n_output_dims, alignment);
-		m_n_to_pad = m_n_padded_output_dims - m_n_output_dims;
+	void set_padded_output_width(uint32_t padded_output_width) override {
+		CHECK_THROW(padded_output_width >= m_n_output_dims);
+		m_n_to_pad = padded_output_width - m_n_output_dims;
 	}
 
-	uint32_t min_alignment() const override {
+	uint32_t required_output_alignment() const override {
 		return 1;
 	}
 
@@ -209,6 +209,72 @@ public:
 		};
 	}
 
+	std::string generate_device_function(const std::string& name) const override {
+		std::ostringstream body;
+		body << dfmt(1, R"(
+				if (fwd_ctx) {{
+					input.to_array((float*)fwd_ctx);
+				}}
+
+				{VEC_OUT} result;
+				TCNN_PRAGMA_UNROLL
+				for (uint32_t i = 0; i < {N_DIMS}; ++i) {{
+					TCNN_PRAGMA_UNROLL
+					for (int k = 0; k < {N_FREQUENCIES}; ++k) {{
+						float x = scalbnf(input[i], k-1) + k * 0.25f;
+						result[i * {N_FREQUENCIES} + k] = ({T})(fabsf(x - floorf(x) - 0.5f) * 4.0f - 1.0f);
+					}}
+				}};
+			)",
+			"VEC_OUT"_a = this->generate_vec_out(),
+			"N_DIMS"_a = this->input_width(),
+			"N_FREQUENCIES"_a = m_n_frequencies,
+			"T"_a = type_to_string<T>()
+		) << "\n" << dfmt(1, R"(
+				TCNN_PRAGMA_UNROLL
+				for (uint32_t i = {N_OUT}; i < {N_PADDED_OUT}; ++i) {{
+					result[i] = ({T})1.0f;
+				}}
+				return result;
+			)",
+			"N_OUT"_a = m_n_output_dims,
+			"N_PADDED_OUT"_a = this->padded_output_width(),
+			"T"_a = type_to_string<T>()
+		);
+
+		return this->generate_device_function_from_body(name, body.str());
+	}
+
+	std::string generate_backward_device_function(const std::string& name, uint32_t n_threads) const override {
+		return this->generate_backward_device_function_from_body(name, dfmt(1, R"(
+				if (!dL_dx) {{
+					return;
+				}}
+
+				{VEC_IN} input((float*)fwd_ctx), result(0.0f);
+
+				TCNN_PRAGMA_UNROLL
+				for (uint32_t i = 0; i < {N_DIMS}; ++i) {{
+					TCNN_PRAGMA_UNROLL
+					for (int k = 0; k < {N_FREQUENCIES}; ++k) {{
+						float x = scalbnf(input[i], k-1) + k * 0.25f;
+						float deriv = scalbnf((int)floorf(x * 2.0f) % 2 == 0 ? -1.0f : 1.0f, k+1);
+						result[i] += (float)dL_dy[i * {N_FREQUENCIES} + k] * deriv;
+					}}
+				}};
+
+				*dL_dx = result;
+			)",
+			"VEC_IN"_a = this->generate_vec_in(),
+			"N_DIMS"_a = this->input_width(),
+			"N_FREQUENCIES"_a = m_n_frequencies
+		));
+	}
+
+	uint32_t device_function_fwd_ctx_bytes() const override {
+		return this->input_width() * sizeof(float);
+	}
+
 private:
 	struct ForwardContext : public Context {
 		GPUMatrix<float> dy_dx;
@@ -219,8 +285,7 @@ private:
 
 	// derived sizes
 	uint32_t m_n_output_dims;
-	uint32_t m_n_padded_output_dims;
 	uint32_t m_n_to_pad = 0;
 };
 
-TCNN_NAMESPACE_END
+}

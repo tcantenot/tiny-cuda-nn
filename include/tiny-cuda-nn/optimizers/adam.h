@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   adam.h
@@ -43,7 +42,7 @@
 #include <string>
 #include <vector>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template <typename T>
 __global__ void adam_step(
@@ -51,17 +50,21 @@ __global__ void adam_step(
 	const uint32_t n_matrix_weights,
 	const float relative_weight_decay,
 	const float absolute_weight_decay,
+	const float weight_clipping_magnitude,
+	const float gradient_clipping_magnitude,
 	const float loss_scale,
 	float learning_rate,
 	const float non_matrix_learning_rate_factor,
 	const bool optimize_matrix_params,
 	const bool optimize_non_matrix_params,
+	const bool skip_zero_grad_non_matrix_params,
 	const float beta1,
 	const float beta2,
 	const float epsilon,
 	const float lower_lr_bound,
 	const float upper_lr_bound,
 	const float l2_reg,
+	const float non_matrix_l2_reg,
 	float* __restrict__ weights_full_precision,
 	T* __restrict__ weights,
 	const T* __restrict__ gradients,
@@ -74,7 +77,7 @@ __global__ void adam_step(
 
 	float gradient = (float)gradients[i] / loss_scale;
 	if (i >= n_matrix_weights) {
-		if (!optimize_non_matrix_params || gradient == 0) {
+		if (!optimize_non_matrix_params || (gradient == 0 && skip_zero_grad_non_matrix_params)) {
 			return;
 		}
 	} else {
@@ -86,8 +89,13 @@ __global__ void adam_step(
 	const float weight_fp = weights_full_precision[i];
 
 	if (i < n_matrix_weights) {
-		// No L2 reg for non-matrix params
 		gradient += l2_reg * weight_fp;
+	} else {
+		gradient += non_matrix_l2_reg * weight_fp;
+	}
+
+	if (gradient_clipping_magnitude != 0.0f) {
+		gradient = copysign(min(abs(gradient), gradient_clipping_magnitude), gradient);
 	}
 
 	const float gradient_sq = gradient * gradient;
@@ -108,7 +116,11 @@ __global__ void adam_step(
 	const float effective_learning_rate = fminf(fmaxf(learning_rate / (sqrtf(second_moment) + epsilon), lower_lr_bound), upper_lr_bound);
 
 	const float decayed_weight = weight_decay(relative_weight_decay * learning_rate, absolute_weight_decay * learning_rate, weight_fp);
-	const float new_weight = decayed_weight - effective_learning_rate * first_moment;
+	float new_weight = decayed_weight - effective_learning_rate * first_moment;
+
+	if (weight_clipping_magnitude != 0.0f) {
+		new_weight = clamp(new_weight, -weight_clipping_magnitude, weight_clipping_magnitude);
+	}
 
 	weights_full_precision[i] = new_weight;
 	weights[i] = (T)new_weight;
@@ -121,25 +133,22 @@ public:
 		update_hyperparams(params);
 	}
 
-	void allocate(std::shared_ptr<ParametricObject<T>> target) override {
-		uint32_t size = (uint32_t)target->n_params();
-
-		m_n_weights = size;
+	void allocate(uint32_t n_weights, const std::vector<std::pair<uint32_t, uint32_t>>& layer_sizes) override {
+		m_n_weights = n_weights;
 		if (m_n_weights <= m_first_moments.size()) {
 			return;
 		}
 
-		m_first_moments.resize(size);
+		m_first_moments.resize(m_n_weights);
 		m_first_moments.memset(0);
 
-		m_second_moments.resize(size);
+		m_second_moments.resize(m_n_weights);
 		m_second_moments.memset(0);
 
-		m_param_steps.resize(size);
+		m_param_steps.resize(m_n_weights);
 		m_param_steps.memset(0);
 
 		m_n_weights_covered_by_matrices = 0;
-		auto layer_sizes = target->layer_sizes();
 
 		for (size_t i = 0; i < layer_sizes.size(); ++i) {
 			m_n_weights_covered_by_matrices += layer_sizes[i].first * layer_sizes[i].second;
@@ -165,17 +174,21 @@ public:
 			m_n_weights_covered_by_matrices,
 			m_relative_weight_decay,
 			m_absolute_weight_decay,
+			m_weight_clipping_magnitude,
+			m_gradient_clipping_magnitude,
 			loss_scale,
 			m_base_learning_rate,
 			m_non_matrix_learning_rate_factor,
 			m_optimize_matrix_params,
 			m_optimize_non_matrix_params,
+			m_skip_zero_grad_non_matrix_params,
 			m_beta1,
 			m_beta2,
 			m_epsilon,
 			lower_lr_bound,
 			upper_lr_bound,
 			m_l2_reg,
+			m_non_matrix_l2_reg,
 			weights_full_precision,
 			weights,
 			gradients,
@@ -238,8 +251,20 @@ public:
 			m_absolute_weight_decay = params["absolute_decay"];
 		}
 
+		if (params.contains("clipping_magnitude")) {
+			m_weight_clipping_magnitude = params["clipping_magnitude"];
+		}
+
+		if (params.contains("gradient_clipping_magnitude")) {
+			m_gradient_clipping_magnitude = params["gradient_clipping_magnitude"];
+		}
+
 		if (params.contains("non_matrix_learning_rate_factor")) {
 			m_non_matrix_learning_rate_factor = params["non_matrix_learning_rate_factor"];
+		}
+
+		if (params.contains("non_matrix_l2_reg")) {
+			m_non_matrix_l2_reg = params["non_matrix_l2_reg"];
 		}
 
 		if (params.contains("optimize_matrix_params")) {
@@ -248,6 +273,10 @@ public:
 
 		if (params.contains("optimize_non_matrix_params")) {
 			m_optimize_non_matrix_params = params["optimize_non_matrix_params"];
+		}
+
+		if (params.contains("skip_zero_grad_non_matrix_params")) {
+			m_skip_zero_grad_non_matrix_params = params["skip_zero_grad_non_matrix_params"];
 		}
 	}
 
@@ -262,9 +291,13 @@ public:
 			{"adabound", m_adabound},
 			{"relative_decay", m_relative_weight_decay},
 			{"absolute_decay", m_absolute_weight_decay},
+			{"clipping_magnitude", m_weight_clipping_magnitude},
+			{"gradient_clipping_magnitude", m_gradient_clipping_magnitude},
 			{"non_matrix_learning_rate_factor", m_non_matrix_learning_rate_factor},
+			{"non_matrix_l2_reg", m_non_matrix_l2_reg},
 			{"optimize_matrix_params", m_optimize_matrix_params},
 			{"optimize_non_matrix_params", m_optimize_non_matrix_params},
+			{"skip_zero_grad_non_matrix_params", m_skip_zero_grad_non_matrix_params},
 		};
 	}
 
@@ -302,20 +335,24 @@ private:
 	uint32_t m_current_step = 0;
 
 	// Hyperparameters
-	float m_non_matrix_learning_rate_factor = 1.0f;
 	float m_base_learning_rate = 1e-3f;
 	float m_beta1 = 0.9f;
 	float m_beta2 = 0.999f;
 	float m_epsilon = 1e-8f;
 	float m_l2_reg = 1e-8f;
+	float m_non_matrix_learning_rate_factor = 1.0f;
+	float m_non_matrix_l2_reg = 0.0f;
 
 	float m_relative_weight_decay = 0.0f;
 	float m_absolute_weight_decay = 0.0f;
+	float m_weight_clipping_magnitude = 0.0f;
+	float m_gradient_clipping_magnitude = 0.0f;
 
 	bool m_adabound = false;
 
 	bool m_optimize_matrix_params = true;
 	bool m_optimize_non_matrix_params = true;
+	bool m_skip_zero_grad_non_matrix_params = true;
 };
 
-TCNN_NAMESPACE_END
+}

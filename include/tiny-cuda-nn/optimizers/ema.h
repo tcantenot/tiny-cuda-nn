@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   ema.h
@@ -40,7 +39,7 @@
 #include <string>
 #include <vector>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template <typename T>
 __global__ void ema_step_full_precision(
@@ -84,20 +83,20 @@ public:
 		update_hyperparams(params);
 	}
 
-	void allocate(std::shared_ptr<ParametricObject<T>> target) override {
-		m_nested->allocate(target);
+	void allocate(uint32_t n_weights, const std::vector<std::pair<uint32_t, uint32_t>>& layer_sizes) override {
+		m_nested->allocate(n_weights, layer_sizes);
 
-		uint32_t size = (uint32_t)target->n_params();
-
-		if (size <= m_weights_ema.size()) {
+		if (n_weights <= m_weights_ema.size()) {
 			return;
 		}
 
-		m_weights_ema.resize(size);
+		m_weights_ema.resize(n_weights);
 		m_weights_ema.memset(0);
 
-		m_tmp.resize(size);
-		m_tmp.memset(0);
+		if (m_full_precision) {
+			m_tmp.resize(n_weights);
+			m_tmp.memset(0);
+		}
 	}
 
 	void step(cudaStream_t stream, float loss_scale, float* weights_full_precision, T* weights, const T* gradients) override {
@@ -156,6 +155,15 @@ public:
 		return m_weights_ema.data();
 	}
 
+	size_t n_nested() const override {
+		return 1;
+	}
+
+	const std::shared_ptr<Optimizer<T>>& nested(size_t idx) const override {
+		CHECK_THROW(idx == 0);
+		return m_nested;
+	}
+
 	void update_hyperparams(const json& params) override {
 		if (params.contains("decay")) {
 			m_ema_decay = params["decay"];
@@ -188,18 +196,22 @@ public:
 
 	void deserialize(const json& data) override {
 		m_weights_ema = data["weights_ema_binary"];
-		m_tmp.resize(m_weights_ema.size());
-		linear_kernel(cast_from<T>, 0, nullptr, m_weights_ema.size(), m_weights_ema.data(), m_tmp.data());
+
+		if (m_full_precision) {
+			m_tmp.resize(m_weights_ema.size());
+			linear_kernel(cast_from<T>, 0, nullptr, m_weights_ema.size(), m_weights_ema.data(), m_tmp.data());
+		}
+
 		m_nested->deserialize(data["nested"]);
 	}
 
 private:
 	float m_ema_decay = 0.99f;
 	bool m_full_precision = false;
-	std::unique_ptr<Optimizer<T>> m_nested;
+	std::shared_ptr<Optimizer<T>> m_nested;
 
 	GPUMemory<T> m_weights_ema;
 	GPUMemory<float> m_tmp;
 };
 
-TCNN_NAMESPACE_END
+}

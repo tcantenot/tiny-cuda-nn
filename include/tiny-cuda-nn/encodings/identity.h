@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   identity.h
@@ -41,12 +40,11 @@
 #include <string>
 #include <vector>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template <typename T>
 __global__ void identity(
 	const uint32_t num_outputs,
-	const uint32_t num_elements,
 	const uint32_t num_to_encode,
 	const uint32_t num_to_pad,
 	const float scale,
@@ -71,7 +69,6 @@ __global__ void identity(
 template <typename T>
 __global__ void identity_backward(
 	const uint32_t num_outputs,
-	const uint32_t num_elements,
 	const uint32_t n_dims_to_encode,
 	const float scale,
 	MatrixView<const T> dL_dy,
@@ -92,9 +89,10 @@ class IdentityEncoding : public Encoding<T> {
 public:
 	IdentityEncoding(uint32_t n_dims_to_encode, float scale = 1.0f, float offset = 0.0f)
 	: m_n_dims_to_encode{n_dims_to_encode}, m_scale{scale}, m_offset{offset} {
-		m_n_padded_output_dims = m_n_output_dims = m_n_dims_to_encode;
+		m_n_output_dims = m_n_dims_to_encode;
 	}
 
+#if !defined(TCNN_NO_FWD_BWD)
 	std::unique_ptr<Context> forward_impl(
 		cudaStream_t stream,
 		const GPUMatrixDynamic<float>& input,
@@ -102,13 +100,12 @@ public:
 		bool use_inference_params = false,
 		bool prepare_input_gradients = false
 	) override {
-		if (!output || m_n_padded_output_dims == 0) {
+		if (!output || padded_output_width() == 0) {
 			return std::make_unique<Context>();
 		}
 
 		linear_kernel(identity<T>, 0, stream,
 			input.n() * padded_output_width(),
-			input.n(),
 			m_n_dims_to_encode,
 			m_n_to_pad,
 			m_scale,
@@ -128,45 +125,44 @@ public:
 		const GPUMatrixDynamic<T>& dL_doutput,
 		GPUMatrixDynamic<float>* dL_dinput = nullptr,
 		bool use_inference_params = false,
-		EGradientMode param_gradients_mode = EGradientMode::Overwrite
+		GradientMode param_gradients_mode = GradientMode::Overwrite
 	) override {
-		if (!dL_dinput || m_n_padded_output_dims == 0) {
+		if (!dL_dinput) {
 			return;
 		}
 
 		linear_kernel(identity_backward<T>, 0, stream,
 			input.n() * m_n_dims_to_encode,
-			input.n(),
 			m_n_dims_to_encode,
 			m_scale,
 			dL_doutput.view(),
 			dL_dinput->view()
 		);
 	}
+#endif // !defined(TCNN_NO_FWD_BWD)
 
 	uint32_t input_width() const override {
 		return m_n_dims_to_encode;
 	}
 
 	uint32_t padded_output_width() const override {
-		return m_n_padded_output_dims;
+		return m_n_output_dims + m_n_to_pad;
 	}
 
 	uint32_t output_width() const override {
-		return m_n_padded_output_dims;
+		return padded_output_width();
 	}
 
 	uint32_t required_input_alignment() const override {
 		return 1;
 	}
 
-	void set_alignment(uint32_t alignment) override {
-		alignment = lcm(alignment, min_alignment());
-		m_n_padded_output_dims = next_multiple(m_n_output_dims, alignment);
-		m_n_to_pad = m_n_padded_output_dims - m_n_output_dims;
+	void set_padded_output_width(uint32_t padded_output_width) override {
+		CHECK_THROW(padded_output_width >= m_n_output_dims);
+		m_n_to_pad = padded_output_width - m_n_output_dims;
 	}
 
-	uint32_t min_alignment() const override {
+	uint32_t required_output_alignment() const override {
 		return 1;
 	}
 
@@ -182,6 +178,39 @@ public:
 		};
 	}
 
+	std::string generate_device_function(const std::string& name) const override {
+		return this->generate_device_function_from_body(name, dfmt(1, R"(
+				{VEC_OUT} result = fma(input, (float){SCALE}, (float){OFFSET});
+				TCNN_PRAGMA_UNROLL
+				for (uint32_t i = {N_OUT}; i < {N_PADDED_OUT}; ++i) {{
+					result[i] = ({T})1.0f;
+				}}
+				return result;
+			)",
+			"VEC_OUT"_a = this->generate_vec_out(),
+			"SCALE"_a = m_scale,
+			"OFFSET"_a = m_offset,
+			"N_OUT"_a = m_n_output_dims,
+			"N_PADDED_OUT"_a = this->padded_output_width(),
+			"T"_a = type_to_string<T>()
+		));
+	}
+
+	std::string generate_backward_device_function(const std::string& name, uint32_t n_threads) const override {
+		return this->generate_backward_device_function_from_body(name, dfmt(1, R"(
+				if (dL_dx) {{
+					*dL_dx = {VEC_IN}(dL_dy) * (float){SCALE};
+				}}
+			)",
+			"VEC_IN"_a = this->generate_vec_in(),
+			"SCALE"_a = m_scale
+		));
+	}
+
+	uint32_t device_function_fwd_ctx_bytes() const override {
+		return 0;
+	}
+
 private:
 	uint32_t m_n_dims_to_encode;
 
@@ -190,8 +219,7 @@ private:
 
 	// derived sizes
 	uint32_t m_n_output_dims;
-	uint32_t m_n_padded_output_dims;
 	uint32_t m_n_to_pad = 0;
 };
 
-TCNN_NAMESPACE_END
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   reduce_sum.h
@@ -34,16 +33,14 @@
 #include <tiny-cuda-nn/gpu_memory.h>
 
 #include <cassert>
-#include <iostream>
-#include <map>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 uint32_t reduce_sum_workspace_size(uint32_t n_elements);
 
 template <typename T>
 inline __device__ T warp_reduce(T val) {
-	#pragma unroll
+	TCNN_PRAGMA_UNROLL
 	for (int offset = warpSize/2; offset > 0; offset /= 2) {
 		val += __shfl_xor_sync(0xffffffff, val, offset);
 	}
@@ -149,6 +146,7 @@ float reduce_sum(T* device_pointer, F fun, uint32_t n_elements, cudaStream_t str
 
 	float sum;
 	CUDA_CHECK_THROW(cudaMemcpyAsync(&sum, workspace_data, sizeof(float), cudaMemcpyDeviceToHost, stream));
+	CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
 	return sum;
 }
 
@@ -196,15 +194,15 @@ __global__ void block_reduce1(
 
 template <typename T, typename F>
 void reduce_sum_old(T* device_pointer, F fun, float* workspace, uint32_t n_elements, cudaStream_t stream) {
-	linear_kernel(block_reduce0<T, F>, sizeof(float) * n_threads_linear, stream, n_elements, fun, device_pointer, workspace);
+	linear_kernel(block_reduce0<T, F>, sizeof(float) * N_THREADS_LINEAR, stream, n_elements, fun, device_pointer, workspace);
 
 	n_elements = n_blocks_linear(n_elements);
 
 	// If the first block reduction wasn't sufficient, keep reducing
 	while (n_elements > 1) {
-		linear_kernel(block_reduce1, sizeof(float) * n_threads_linear, stream, n_elements, workspace);
+		linear_kernel(block_reduce1, sizeof(float) * N_THREADS_LINEAR, stream, n_elements, workspace);
 		n_elements = n_blocks_linear(n_elements);
 	}
 }
 
-TCNN_NAMESPACE_END
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,17 +20,35 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
-/** @file   common_device.cu
- *  @author Thomas Müller & Nikolaus Binder, NVIDIA
- *  @brief  Implementation of various miscellaneous CUDA kernels and
-            device functions.
+/** @file   test_encodings.cu
+ *  @author Thomas Müller, NVIDIA
+ *  @brief  Test various invariances of input encodings. E.g. that `inference`
+ *          and `inference_mixed_precision` produce the same results, that JIT
+ *          produces the same result as no-JIT, as well as the same for derivatives.
  */
 
-#include <tiny-cuda-nn/common_device.h>
+#include "test_common.h"
 
-TCNN_NAMESPACE_BEGIN
+#include <tiny-cuda-nn/encoding.h>
 
-TCNN_NAMESPACE_END
+using namespace tcnn;
+
+TEMPLATE_TEST_CASE("Various invariance checks for input encodings", "[encoding][jit]", network_precision_t, float) {
+	using T = TestType;
+
+	tcnn_test_setup();
+
+	for (const auto& encoding_name : builtin_encodings()) {
+		SECTION(fmt::format("Testing {}", encoding_name)) {
+			// Typical number of input dims is 3D (e.g. 3D space), but we need to special-case for some encodings that require more.
+			const uint32_t n_dims = equals_case_insensitive(encoding_name, "NRC") || equals_case_insensitive(encoding_name, "OneBlobFrequency") ? 8 : 3;
+			const uint32_t alignment = 16; // Common value due to tensor core width
+
+			std::shared_ptr<Encoding<T>> encoding = default_encoding<T>(n_dims, encoding_name);
+			encoding->set_alignment(alignment);
+			test_differentiable_object<float, T, T>(encoding);
+		}
+	}
+}

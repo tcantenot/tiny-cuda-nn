@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   network_with_input_encoding.h
@@ -37,11 +36,13 @@
 #include <tiny-cuda-nn/gpu_memory.h>
 #include <tiny-cuda-nn/network.h>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 template <typename T>
 class NetworkWithInputEncoding : public Network<float, T> {
 public:
+	NetworkWithInputEncoding(std::shared_ptr<Encoding<T>> encoding, std::shared_ptr<Network<T>> network) : m_encoding{encoding}, m_network{network} {}
+
 	NetworkWithInputEncoding(std::shared_ptr<Encoding<T>> encoding, uint32_t n_output_dims, const json& network) : m_encoding{encoding} {
 		encoding->set_alignment(minimum_alignment(network));
 
@@ -74,7 +75,7 @@ public:
 
 		forward->network_input = GPUMatrixDynamic<T>{m_encoding->padded_output_width(), input.n(), stream, m_encoding->preferred_output_layout()};
 		forward->encoding_ctx = m_encoding->forward(stream, input, &forward->network_input, use_inference_params, prepare_input_gradients);
-		forward->network_ctx = m_network->forward(stream, forward->network_input, output, use_inference_params, prepare_input_gradients);
+		forward->network_ctx = m_network->forward(stream, forward->network_input, output, use_inference_params, true);
 
 		return forward;
 	}
@@ -87,7 +88,7 @@ public:
 		const GPUMatrixDynamic<T>& dL_doutput,
 		GPUMatrixDynamic<float>* dL_dinput = nullptr,
 		bool use_inference_params = false,
-		EGradientMode param_gradients_mode = EGradientMode::Overwrite
+		GradientMode param_gradients_mode = GradientMode::Overwrite
 	) override {
 		GPUMatrixDynamic<T> dL_dnetwork_input;
 		if (m_encoding->n_params() > 0 || dL_dinput) {
@@ -111,48 +112,21 @@ public:
 		}
 	}
 
-	void set_params(T* params, T* inference_params, T* backward_params, T* gradients) override {
+	void set_params_impl(T* params, T* inference_params, T* gradients) override {
 		size_t offset = 0;
-		m_network->set_params(
-			params + offset,
-			inference_params + offset,
-			backward_params + offset,
-			gradients + offset
-		);
+		m_network->set_params(params + offset, inference_params + offset, gradients + offset);
 		offset += m_network->n_params();
 
-		m_encoding->set_params(
-			params + offset,
-			inference_params + offset,
-			backward_params + offset,
-			gradients + offset
-		);
+		m_encoding->set_params(params + offset, inference_params + offset, gradients + offset);
 		offset += m_encoding->n_params();
 	}
 
-	void initialize_params(pcg32& rnd, float* params_full_precision, T* params, T* inference_params, T* backward_params, T* gradients, float scale = 1) override {
-		size_t offset = 0;
-		m_network->initialize_params(
-			rnd,
-			params_full_precision + offset,
-			params + offset,
-			inference_params + offset,
-			backward_params + offset,
-			gradients + offset,
-			scale
-		);
-		offset += m_network->n_params();
+	void initialize_params(pcg32& rnd, float* params_full_precision, float scale = 1) override {
+		m_network->initialize_params(rnd, params_full_precision, scale);
+		params_full_precision += m_network->n_params();
 
-		m_encoding->initialize_params(
-			rnd,
-			params_full_precision + offset,
-			params + offset,
-			inference_params + offset,
-			backward_params + offset,
-			gradients + offset,
-			scale
-		);
-		offset += m_encoding->n_params();
+		m_encoding->initialize_params(rnd, params_full_precision, scale);
+		params_full_precision += m_encoding->n_params();
 	}
 
 	size_t n_params() const override {
@@ -204,9 +178,82 @@ public:
 		};
 	}
 
+	std::string generate_device_function(const std::string& name) const override {
+		std::string encoding = name + "_encoding";
+		std::string network = name + "_network";
+
+		std::ostringstream preamble;
+		preamble
+			<< m_network->generate_device_function(network) << "\n\n"
+			<< m_encoding->generate_device_function(encoding) << "\n\n"
+			;
+
+		std::string body = dfmt(1, R"(
+				return {MLP}({ENC}(input, params + {ENC_PARAMS_OFFSET}, fwd_ctx ? fwd_ctx + WARP_SIZE * {ENC_FWD_CTX_OFFSET} : nullptr), params, fwd_ctx);
+			)",
+			"ENC"_a = encoding,
+			"ENC_PARAMS_OFFSET"_a = m_encoding->params() - this->params(),
+			"ENC_FWD_CTX_OFFSET"_a = m_network->device_function_fwd_ctx_bytes(),
+			"MLP"_a = network
+		);
+
+		return fmt::format("{}{}", preamble.str(), this->generate_device_function_from_body(name, body));
+	}
+
+	std::string generate_backward_device_function(const std::string& name, uint32_t n_threads) const override {
+		std::string encoding = name + "_encoding";
+		std::string network = name + "_network";
+
+		std::ostringstream preamble;
+		preamble
+			<< m_network->generate_backward_device_function(network, n_threads) << "\n\n"
+			<< m_encoding->generate_backward_device_function(encoding, n_threads) << "\n\n"
+			;
+
+		std::string body = dfmt(1, R"(
+				bool requires_encoding_bwd = {ENC_N_PARAMS} != 0 || dL_dx;
+				{ENC_VEC_OUT} dL_denc;
+				{MLP}(dL_dy, params, fwd_ctx, dL_dparams, requires_encoding_bwd ? &dL_denc : nullptr);
+				if (requires_encoding_bwd) {{
+					{ENC}(dL_denc, params + {ENC_PARAMS_OFFSET}, fwd_ctx + WARP_SIZE * {ENC_FWD_CTX_OFFSET}, dL_dparams ? dL_dparams + {ENC_PARAMS_OFFSET} : nullptr, dL_dx);
+				}}
+			)",
+			"ENC"_a = encoding,
+			"ENC_VEC_OUT"_a = m_encoding->generate_vec_out(),
+			"ENC_N_PARAMS"_a = m_encoding->n_params(),
+			"ENC_PARAMS_OFFSET"_a = m_encoding->params() - this->params(),
+			"ENC_FWD_CTX_OFFSET"_a = m_network->device_function_fwd_ctx_bytes(),
+			"MLP"_a = network
+		);
+
+		return fmt::format("{}{}", preamble.str(), this->generate_backward_device_function_from_body(name, body));
+	}
+
+	uint32_t device_function_fwd_ctx_bytes() const override {
+		return m_network->device_function_fwd_ctx_bytes() + m_encoding->device_function_fwd_ctx_bytes();
+	}
+
+	bool device_function_fwd_ctx_aligned_per_element() const override {
+		return false;
+	}
+
+	uint32_t backward_device_function_shmem_bytes(uint32_t n_threads, GradientMode param_gradients_mode) const override {
+		return std::max(m_network->backward_device_function_shmem_bytes(n_threads, param_gradients_mode), m_encoding->backward_device_function_shmem_bytes(n_threads, param_gradients_mode));
+	}
+
+	void convert_params_to_jit_layout(cudaStream_t stream, bool use_inference_params) override {
+		m_network->convert_params_to_jit_layout(stream, use_inference_params);
+		m_encoding->convert_params_to_jit_layout(stream, use_inference_params);
+	}
+
+	void convert_params_from_jit_layout(cudaStream_t stream, bool use_inference_params) override {
+		m_network->convert_params_from_jit_layout(stream, use_inference_params);
+		m_encoding->convert_params_from_jit_layout(stream, use_inference_params);
+	}
+
 private:
-	std::unique_ptr<Network<T>> m_network;
 	std::shared_ptr<Encoding<T>> m_encoding;
+	std::shared_ptr<Network<T>> m_network;
 
 	struct ForwardContext : public Context {
 		GPUMatrixDynamic<T> network_input;
@@ -215,4 +262,4 @@ private:
 	};
 };
 
-TCNN_NAMESPACE_END
+}

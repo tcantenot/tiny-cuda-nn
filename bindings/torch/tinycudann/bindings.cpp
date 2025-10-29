@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   torch_bindings.cu
@@ -36,6 +35,7 @@
 #endif
 
 #include <ATen/cuda/CUDAUtils.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #ifdef snprintf
 #undef snprintf
@@ -44,6 +44,7 @@
 #include <json/json.hpp>
 
 #include <pybind11_json/pybind11_json.hpp>
+#include <pybind11/functional.h>
 
 #include <tiny-cuda-nn/cpp_api.h>
 
@@ -53,10 +54,10 @@
 #define CHECK_THROW(x) \
 	do { if (!(x)) throw std::runtime_error(std::string(FILE_LINE " check failed " #x)); } while(0)
 
-c10::ScalarType torch_type(tcnn::cpp::EPrecision precision) {
+c10::ScalarType torch_type(tcnn::cpp::Precision precision) {
 	switch (precision) {
-		case tcnn::cpp::EPrecision::Fp32: return torch::kFloat32;
-		case tcnn::cpp::EPrecision::Fp16: return torch::kHalf;
+		case tcnn::cpp::Precision::Fp32: return torch::kFloat32;
+		case tcnn::cpp::Precision::Fp16: return torch::kHalf;
 		default: throw std::runtime_error{"Unknown precision tcnn->torch"};
 	}
 }
@@ -69,11 +70,16 @@ void* void_data_ptr(torch::Tensor& tensor) {
 	}
 }
 
+#define CHECK_INPUT(x) CHECK_THROW(x.device().is_cuda()); CHECK_THROW(x.is_contiguous())
+
 class Module {
 public:
 	Module(tcnn::cpp::Module* module) : m_module{module} {}
 
 	std::tuple<tcnn::cpp::Context, torch::Tensor> fwd(torch::Tensor input, torch::Tensor params) {
+		CHECK_INPUT(input);
+		CHECK_INPUT(params);
+
 		// Types
 		CHECK_THROW(input.scalar_type() == torch::kFloat32);
 		CHECK_THROW(params.scalar_type() == c10_param_precision());
@@ -82,10 +88,16 @@ public:
 		CHECK_THROW(input.size(1) == n_input_dims());
 		CHECK_THROW(params.size(0) == n_params());
 
+		// Device
+		at::Device device = input.device();
+		CHECK_THROW(device == params.device());
+
+		const at::cuda::CUDAGuard device_guard{device};
 		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 		uint32_t batch_size = input.size(0);
-		torch::Tensor output = torch::empty({ batch_size, n_output_dims() }, torch::TensorOptions().dtype(c10_output_precision()).device(torch::kCUDA));
+
+		torch::Tensor output = torch::empty({ batch_size, n_output_dims() }, torch::TensorOptions().dtype(c10_output_precision()).device(device));
 
 		tcnn::cpp::Context ctx;
 		if (!input.requires_grad() && !params.requires_grad()) {
@@ -102,6 +114,11 @@ public:
 			throw std::runtime_error{"Module::bwd: called with invalid context. fwd likely (mistakenly) ran in inference mode."};
 		}
 
+		CHECK_INPUT(input);
+		CHECK_INPUT(params);
+		CHECK_INPUT(output);
+		CHECK_INPUT(dL_doutput);
+
 		// Types
 		CHECK_THROW(input.scalar_type() == torch::kFloat32);
 		CHECK_THROW(params.scalar_type() == c10_param_precision());
@@ -115,18 +132,25 @@ public:
 		CHECK_THROW(output.size(0) == input.size(0));
 		CHECK_THROW(dL_doutput.size(0) == input.size(0));
 
-		uint32_t batch_size = input.size(0);
+		// Device
+		at::Device device = input.device();
+		CHECK_THROW(device == params.device());
+		CHECK_THROW(device == output.device());
+		CHECK_THROW(device == dL_doutput.device());
 
+		const at::cuda::CUDAGuard device_guard{device};
 		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+		uint32_t batch_size = input.size(0);
 
 		torch::Tensor dL_dinput;
 		if (input.requires_grad()) {
-			dL_dinput = torch::empty({ batch_size, input.size(1) }, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+			dL_dinput = torch::empty({ batch_size, input.size(1) }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 		}
 
 		torch::Tensor dL_dparams;
 		if (params.requires_grad()) {
-			dL_dparams = torch::empty({ n_params() }, torch::TensorOptions().dtype(c10_param_precision()).device(torch::kCUDA));
+			dL_dparams = torch::empty({ n_params() }, torch::TensorOptions().dtype(c10_param_precision()).device(device));
 		}
 
 		if (input.requires_grad() || params.requires_grad()) {
@@ -154,6 +178,11 @@ public:
 			throw std::runtime_error{"Module::bwd_bwd_input: called with invalid context. fwd likely (mistakenly) ran in inference mode."};
 		}
 
+		CHECK_INPUT(input);
+		CHECK_INPUT(params);
+		CHECK_INPUT(dL_ddLdinput);
+		CHECK_INPUT(dL_doutput);
+
 		// Types
 		CHECK_THROW(input.scalar_type() == torch::kFloat32);
 		CHECK_THROW(dL_ddLdinput.scalar_type() == torch::kFloat32);
@@ -168,23 +197,30 @@ public:
 		CHECK_THROW(dL_doutput.size(0) == input.size(0));
 		CHECK_THROW(dL_ddLdinput.size(0) == input.size(0));
 
-		uint32_t batch_size = input.size(0);
+		// Device
+		at::Device device = input.device();
+		CHECK_THROW(device == params.device());
+		CHECK_THROW(device == dL_ddLdinput.device());
+		CHECK_THROW(device == dL_doutput.device());
 
+		const at::cuda::CUDAGuard device_guard{device};
 		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+		uint32_t batch_size = input.size(0);
 
 		torch::Tensor dL_ddLdoutput;
 		if (dL_doutput.requires_grad()) {
-			dL_ddLdoutput = torch::zeros({ batch_size, n_output_dims() }, torch::TensorOptions().dtype(c10_output_precision()).device(torch::kCUDA));
+			dL_ddLdoutput = torch::zeros({ batch_size, n_output_dims() }, torch::TensorOptions().dtype(c10_output_precision()).device(device));
 		}
 
 		torch::Tensor dL_dparams;
 		if (params.requires_grad()) {
-			dL_dparams = torch::zeros({ n_params() }, torch::TensorOptions().dtype(c10_param_precision()).device(torch::kCUDA));
+			dL_dparams = torch::zeros({ n_params() }, torch::TensorOptions().dtype(c10_param_precision()).device(device));
 		}
 
 		torch::Tensor dL_dinput;
 		if (input.requires_grad()) {
-			dL_dinput = torch::zeros({ batch_size, n_input_dims() }, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+			dL_dinput = torch::zeros({ batch_size, n_input_dims() }, torch::TensorOptions().dtype(torch::kFloat32).device(device));
 		}
 
 		if (dL_doutput.requires_grad() || params.requires_grad()) {
@@ -211,41 +247,21 @@ public:
 		return output;
 	}
 
-	uint32_t n_input_dims() const {
-		return m_module->n_input_dims();
-	}
+	uint32_t n_input_dims() const { return m_module->n_input_dims(); }
 
-	uint32_t n_params() const {
-		return (uint32_t)m_module->n_params();
-	}
+	uint32_t n_params() const { return (uint32_t)m_module->n_params(); }
+	tcnn::cpp::Precision param_precision() const { return m_module->param_precision(); }
+	c10::ScalarType c10_param_precision() const { return torch_type(param_precision()); }
 
-	tcnn::cpp::EPrecision param_precision() const {
-		return m_module->param_precision();
-	}
+	uint32_t n_output_dims() const { return m_module->n_output_dims(); }
+	tcnn::cpp::Precision output_precision() const { return m_module->output_precision(); }
+	c10::ScalarType c10_output_precision() const { return torch_type(output_precision()); }
 
-	c10::ScalarType c10_param_precision() const {
-		return torch_type(param_precision());
-	}
+	nlohmann::json hyperparams() const { return m_module->hyperparams(); }
+	std::string name() const { return m_module->name(); }
 
-	uint32_t n_output_dims() const {
-		return m_module->n_output_dims();
-	}
-
-	tcnn::cpp::EPrecision output_precision() const {
-		return m_module->output_precision();
-	}
-
-	c10::ScalarType c10_output_precision() const {
-		return torch_type(output_precision());
-	}
-
-	nlohmann::json hyperparams() const {
-		return m_module->hyperparams();
-	}
-
-	std::string name() const {
-		return m_module->name();
-	}
+	bool jit_fusion() const { return m_module->jit_fusion(); }
+	void set_jit_fusion(bool val) { m_module->set_jit_fusion(val); }
 
 private:
 	std::unique_ptr<tcnn::cpp::Module> m_module;
@@ -261,20 +277,37 @@ Module create_network(uint32_t n_input_dims, uint32_t n_output_dims, const nlohm
 }
 #endif
 
-Module create_encoding(uint32_t n_input_dims, const nlohmann::json& encoding, tcnn::cpp::EPrecision requested_precision) {
+Module create_encoding(uint32_t n_input_dims, const nlohmann::json& encoding, tcnn::cpp::Precision requested_precision) {
 	return Module{tcnn::cpp::create_encoding(n_input_dims, encoding, requested_precision)};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-	py::enum_<tcnn::cpp::EPrecision>(m, "Precision")
-		.value("Fp32", tcnn::cpp::EPrecision::Fp32)
-		.value("Fp16", tcnn::cpp::EPrecision::Fp16)
+	py::enum_<tcnn::cpp::LogSeverity>(m, "LogSeverity")
+		.value("Info", tcnn::cpp::LogSeverity::Info)
+		.value("Debug", tcnn::cpp::LogSeverity::Debug)
+		.value("Warning", tcnn::cpp::LogSeverity::Warning)
+		.value("Error", tcnn::cpp::LogSeverity::Error)
+		.value("Success", tcnn::cpp::LogSeverity::Success)
 		.export_values()
 		;
 
-	m.def("preferred_precision", &tcnn::cpp::preferred_precision);
+	py::enum_<tcnn::cpp::Precision>(m, "Precision")
+		.value("Fp32", tcnn::cpp::Precision::Fp32)
+		.value("Fp16", tcnn::cpp::Precision::Fp16)
+		.export_values()
+		;
+
 	m.def("batch_size_granularity", &tcnn::cpp::batch_size_granularity);
+	m.def("default_loss_scale", &tcnn::cpp::default_loss_scale);
 	m.def("free_temporary_memory", &tcnn::cpp::free_temporary_memory);
+	m.def("has_networks", &tcnn::cpp::has_networks);
+	m.def("preferred_precision", &tcnn::cpp::preferred_precision);
+
+	m.def("supports_jit_fusion", &tcnn::cpp::supports_jit_fusion, py::arg("device")=-1);
+	m.def("rtc_set_cache_dir", &tcnn::cpp::rtc_set_cache_dir);
+	m.def("rtc_set_include_dir", &tcnn::cpp::rtc_set_include_dir);
+
+	m.def("set_log_callback", &tcnn::cpp::set_log_callback);
 
 	// Encapsulates an abstract context of an operation
 	// (commonly the forward pass) to be passed on to other
@@ -298,6 +331,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		.def("output_precision", &Module::output_precision)
 		.def("hyperparams", &Module::hyperparams)
 		.def("name", &Module::name)
+		.def_property("jit_fusion", &Module::jit_fusion, &Module::set_jit_fusion)
 		;
 
 #if !defined(TCNN_NO_NETWORKS)

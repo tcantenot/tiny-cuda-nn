@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   cutlass_matmul.h
@@ -46,31 +45,16 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
-#include <iostream>
-#include <map>
 #include <type_traits>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
-#define CUTLASS_CHECK(status)                                                                      \
-{                                                                                                  \
-	cutlass::Status error = status;                                                                \
-	if (error != cutlass::Status::kSuccess) {                                                      \
-		std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: " << __LINE__ \
-		          << std::endl;                                                                    \
-		exit(EXIT_FAILURE);                                                                        \
-	}                                                                                              \
-}
-
-#define CUDA_CHECK(status)                                                \
-{                                                                         \
-	cudaError_t error = status;                                           \
-	if (error != cudaSuccess) {                                           \
-		std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
-		          << " at line: " << __LINE__ << std::endl;               \
-		exit(EXIT_FAILURE);                                               \
-	}                                                                     \
-}
+#define CUTLASS_CHECK_THROW(x)                                                                                               \
+	do {                                                                                                                     \
+		cutlass::Status _result = x;                                                                                         \
+		if (_result != cutlass::Status::kSuccess)                                                                            \
+			throw std::runtime_error(std::string(FILE_LINE " " #x " failed with error ") + cutlassGetStatusString(_result)); \
+	} while(0)
 
 using SmArch = std::conditional_t<MIN_GPU_ARCH >= 80,
 	std::conditional_t<std::is_same<network_precision_t, float>::value, cutlass::arch::Sm75, cutlass::arch::Sm80>,
@@ -339,11 +323,11 @@ void fc_multiply_impl(cudaStream_t stream, const typename Gemm::Arguments& args)
 	// Initialize CUTLASS kernel with arguments and workspace pointer
 	auto workspace = allocate_workspace(stream, workspace_size);
 	cutlass::Status status = gemm_op.initialize(args, workspace.data(), stream);
-	CUTLASS_CHECK(status);
+	CUTLASS_CHECK_THROW(status);
 
 	// Launch initialized CUTLASS kernel
 	status = gemm_op(stream);
-	CUTLASS_CHECK(status);
+	CUTLASS_CHECK_THROW(status);
 }
 
 template <class Gemm>
@@ -357,15 +341,28 @@ void fc_multiply_split_k_impl(cudaStream_t stream, const typename Gemm::Argument
 	// Initialize CUTLASS kernel with arguments and workspace pointer
 	auto workspace = allocate_workspace(stream, workspace_size);
 	cutlass::Status status = gemm_op.initialize(args, workspace.data());
-	CUTLASS_CHECK(status);
+	CUTLASS_CHECK_THROW(status);
 
 	// Launch initialized CUTLASS kernel
 	status = gemm_op(stream);
-	CUTLASS_CHECK(status);
+	CUTLASS_CHECK_THROW(status);
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, MatrixLayout LayoutB, typename TypeC, MatrixLayout LayoutC, typename TypeD, MatrixLayout LayoutD>
-void fc_multiply(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const GPUMatrix<TypeB, LayoutB>& B, const GPUMatrix<TypeC, LayoutC>& C, const GPUMatrix<TypeD, LayoutD>& D, Activation act = Activation::None, bool transfer = false, bool sum_source = false) {
+void fc_multiply(
+	cudaStream_t stream,
+	const GPUMatrix<TypeA,
+	LayoutA>& A,
+	const GPUMatrix<TypeB,
+	LayoutB>& B,
+	const GPUMatrix<TypeC,
+	LayoutC>& C,
+	const GPUMatrix<TypeD,
+	LayoutD>& D,
+	Activation act = Activation::None,
+	bool transfer = false,
+	bool sum_source = false
+) {
 	using CutlassLayoutA = typename std::conditional<LayoutA == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
 	using CutlassLayoutB = typename std::conditional<LayoutB == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
 	using CutlassLayoutC = typename std::conditional<LayoutC == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
@@ -387,11 +384,11 @@ void fc_multiply(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const 
 	const int N = B.n();
 
 	if (C.m() != M || C.n() != N) {
-		throw std::runtime_error(std::string("Matrix C has incorrect size ") + std::to_string(C.m()) + "," + std::to_string(C.n()) + "!=" + std::to_string(M) + "," + std::to_string(N));
+		throw std::runtime_error{fmt::format("Matrix C has incorrect size {}x{} != {}x{}", C.m(), C.n(), M, N)};
 	}
 
 	if (D.m() != M || D.n() != N) {
-		throw std::runtime_error(std::string("Matrix D has incorrect size ") + std::to_string(D.m()) + "," + std::to_string(D.n()) + "!=" + std::to_string(M) + "," + std::to_string(N));
+		throw std::runtime_error{fmt::format("Matrix D has incorrect size {}x{} != {}x{}", D.m(), D.n(), M, N)};
 	}
 
 	if (transfer) {
@@ -424,7 +421,18 @@ void fc_multiply(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const 
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, MatrixLayout LayoutB, typename TypeC, typename TypeD>
-void fc_multiply(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const GPUMatrix<TypeB, LayoutB>& B, const GPUMatrixDynamic<TypeC>& C, const GPUMatrixDynamic<TypeD>& D, Activation act = Activation::None, bool transfer = false, bool sum_source = false) {
+void fc_multiply(
+	cudaStream_t stream,
+	const GPUMatrix<TypeA,
+	LayoutA>& A,
+	const GPUMatrix<TypeB,
+	LayoutB>& B,
+	const GPUMatrixDynamic<TypeC>& C,
+	const GPUMatrixDynamic<TypeD>& D,
+	Activation act = Activation::None,
+	bool transfer = false,
+	bool sum_source = false
+) {
 	if (C.layout() != D.layout()) {
 		throw std::runtime_error{"fc_multiply: Layout of GPUMatrixDynamic C and D must be equal"};
 	}
@@ -437,7 +445,17 @@ void fc_multiply(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const 
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, typename TypeC, typename TypeD>
-void fc_multiply(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const GPUMatrixDynamic<TypeB>& B, const GPUMatrixDynamic<TypeC>& C, const GPUMatrixDynamic<TypeD>& D, Activation act = Activation::None, bool transfer = false, bool sum_source = false) {
+void fc_multiply(
+	cudaStream_t stream,
+	const GPUMatrix<TypeA,
+	LayoutA>& A,
+	const GPUMatrixDynamic<TypeB>& B,
+	const GPUMatrixDynamic<TypeC>& C,
+	const GPUMatrixDynamic<TypeD>& D,
+	Activation act = Activation::None,
+	bool transfer = false,
+	bool sum_source = false
+) {
 	if (B.layout() == CM) {
 		fc_multiply<config>(stream, A, B.cm(), C, D, act, transfer, sum_source);
 	} else {
@@ -446,12 +464,31 @@ void fc_multiply(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const 
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, typename TypeD>
-void fc_multiply(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const GPUMatrixDynamic<TypeB>& B, const GPUMatrixDynamic<TypeD>& D, Activation act = Activation::None) {
+void fc_multiply(
+	cudaStream_t stream,
+	const GPUMatrix<TypeA,
+	LayoutA>& A,
+	const GPUMatrixDynamic<TypeB>& B,
+	const GPUMatrixDynamic<TypeD>& D,
+	Activation act = Activation::None
+) {
 	fc_multiply<config>(stream, A, B, D, D, act);
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, MatrixLayout LayoutB, typename TypeC, MatrixLayout LayoutC, typename TypeD, MatrixLayout LayoutD>
-void fc_multiply_split_k(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const GPUMatrix<TypeB, LayoutB>& B, const GPUMatrix<TypeC, LayoutC>& C, const GPUMatrix<TypeD, LayoutD>& D, int split_k_slices = 1, float beta = 0.0f) {
+void fc_multiply_split_k(
+	cudaStream_t stream,
+	const GPUMatrix<TypeA,
+	LayoutA>& A,
+	const GPUMatrix<TypeB,
+	LayoutB>& B,
+	const GPUMatrix<TypeC,
+	LayoutC>& C,
+	const GPUMatrix<TypeD,
+	LayoutD>& D,
+	uint32_t split_k_slices = 1,
+	float beta = 0.0f
+) {
 	using CutlassLayoutA = typename std::conditional<LayoutA == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
 	using CutlassLayoutB = typename std::conditional<LayoutB == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
 	using CutlassLayoutC = typename std::conditional<LayoutC == RM, cutlass::layout::RowMajor, cutlass::layout::ColumnMajor>::type;
@@ -473,11 +510,11 @@ void fc_multiply_split_k(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A
 	const int N = B.n();
 
 	if (C.m() != M || C.n() != N) {
-		throw std::runtime_error(std::string("Matrix C has incorrect size ") + std::to_string(C.m()) + "," + std::to_string(C.n()) + "!=" + std::to_string(M) + "," + std::to_string(N));
+		throw std::runtime_error{fmt::format("Matrix C has incorrect size {}x{} != {}x{}", C.m(), C.n(), M, N)};
 	}
 
 	if (D.m() != M || D.n() != N) {
-		throw std::runtime_error(std::string("Matrix D has incorrect size ") + std::to_string(D.m()) + "," + std::to_string(D.n()) + "!=" + std::to_string(M) + "," + std::to_string(N));
+		throw std::runtime_error{fmt::format("Matrix D has incorrect size {}x{} != {}x{}", D.m(), D.n(), M, N)};
 	}
 
 	using Gemm = SplitKGemm<SumOp<MatmulTypeAccumulator>, config, MatmulTypeCompute, CutlassLayoutA, MatmulTypeCompute, CutlassLayoutB, MatmulTypeAccumulator, CutlassLayoutC>;
@@ -488,14 +525,24 @@ void fc_multiply_split_k(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A
 		{(MatmulTypeAccumulator*)C.data(), (int)C.stride()},
 		{(MatmulTypeAccumulator*)D.data(), (int)D.stride()},
 		{(TypeCompute)1.0f, (TypeCompute)beta},
-		split_k_slices
+		(int)split_k_slices
 	};
 
 	fc_multiply_split_k_impl<Gemm>(stream, arguments);
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, MatrixLayout LayoutB, typename TypeC, typename TypeD>
-void fc_multiply_split_k(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const GPUMatrix<TypeB, LayoutB>& B, const GPUMatrixDynamic<TypeC>& C, const GPUMatrixDynamic<TypeD>& D, int split_k_slices = 1, float beta = 0.0f) {
+void fc_multiply_split_k(
+	cudaStream_t stream,
+	const GPUMatrix<TypeA,
+	LayoutA>& A,
+	const GPUMatrix<TypeB,
+	LayoutB>& B,
+	const GPUMatrixDynamic<TypeC>& C,
+	const GPUMatrixDynamic<TypeD>& D,
+	uint32_t split_k_slices = 1,
+	float beta = 0.0f
+) {
 	if (C.layout() != D.layout()) {
 		throw std::runtime_error{"fc_multiply: Layout of GPUMatrixDynamic C and D must be equal"};
 	}
@@ -508,7 +555,16 @@ void fc_multiply_split_k(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A
 }
 
 template <typename config, typename TypeA, MatrixLayout LayoutA, typename TypeB, typename TypeC, typename TypeD>
-void fc_multiply_split_k(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A, const GPUMatrixDynamic<TypeB>& B, const GPUMatrixDynamic<TypeC>& C, const GPUMatrixDynamic<TypeD>& D, int split_k_slices = 1, float beta = 0.0f) {
+void fc_multiply_split_k(
+	cudaStream_t stream,
+	const GPUMatrix<TypeA,
+	LayoutA>& A,
+	const GPUMatrixDynamic<TypeB>& B,
+	const GPUMatrixDynamic<TypeC>& C,
+	const GPUMatrixDynamic<TypeD>& D,
+	uint32_t split_k_slices = 1,
+	float beta = 0.0f
+) {
 	if (B.layout() == CM) {
 		fc_multiply_split_k<config>(stream, A, B.cm(), C, D, split_k_slices, beta);
 	} else {
@@ -517,7 +573,15 @@ void fc_multiply_split_k(cudaStream_t stream, const GPUMatrix<TypeA, LayoutA>& A
 }
 
 template <typename config, typename TypeA, typename TypeB, typename TypeC, typename TypeD>
-void fc_multiply_split_k(cudaStream_t stream, const GPUMatrixDynamic<TypeA>& A, const GPUMatrixDynamic<TypeB>& B, const GPUMatrixDynamic<TypeC>& C, const GPUMatrixDynamic<TypeD>& D, int split_k_slices = 1, float beta = 0.0f) {
+void fc_multiply_split_k(
+	cudaStream_t stream,
+	const GPUMatrixDynamic<TypeA>& A,
+	const GPUMatrixDynamic<TypeB>& B,
+	const GPUMatrixDynamic<TypeC>& C,
+	const GPUMatrixDynamic<TypeD>& D,
+	uint32_t split_k_slices = 1,
+	float beta = 0.0f
+) {
 	if (A.layout() == CM) {
 		fc_multiply_split_k<config>(stream, A.cm(), B, C, D, split_k_slices, beta);
 	} else {
@@ -526,8 +590,15 @@ void fc_multiply_split_k(cudaStream_t stream, const GPUMatrixDynamic<TypeA>& A, 
 }
 
 template <typename config, typename TypeA, typename TypeB, typename TypeD>
-void fc_multiply_split_k(cudaStream_t stream, const GPUMatrixDynamic<TypeA>& A, const GPUMatrixDynamic<TypeB>& B, const GPUMatrixDynamic<TypeD>& D, int split_k_slices, float beta) {
+void fc_multiply_split_k(
+	cudaStream_t stream,
+	const GPUMatrixDynamic<TypeA>& A,
+	const GPUMatrixDynamic<TypeB>& B,
+	const GPUMatrixDynamic<TypeD>& D,
+	uint32_t split_k_slices,
+	float beta
+) {
 	fc_multiply_split_k<config>(stream, A, B, D, D, split_k_slices, beta);
 }
 
-TCNN_NAMESPACE_END
+}

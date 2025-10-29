@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2022, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are permitted
  * provided that the following conditions are met:
@@ -20,7 +20,6 @@
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
  * STRICT LIABILITY, OR TOR (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *//*
  */
 
 /** @file   reduce_sum.cu
@@ -30,7 +29,7 @@
 
 #include <tiny-cuda-nn/reduce_sum.h>
 
-TCNN_NAMESPACE_BEGIN
+namespace tcnn {
 
 __global__ void block_reduce1(
 	const uint32_t n_elements,
@@ -65,4 +64,4 @@ uint32_t reduce_sum_workspace_size(uint32_t n_elements) {
 	return n_blocks_linear(n_elements);
 }
 
-TCNN_NAMESPACE_END
+}
